@@ -1,152 +1,118 @@
 #include <cmath>
 #include <limits>
-#include <random>
 #include <vector>
 
 #include "armor_solver/axis_mpc.hpp"
 #include "gtest/gtest.h"
 
 namespace qd::auto_aim {
-TEST(AxisMpc, holdsStationaryReference) {
+TEST(AngleCommandMpc, holdsAndCommandsAnAngleInsteadOfFourMillisecondPosition) {
     AxisMpc::Config config;
     AxisMpc mpc(config);
-    const auto sample = mpc.plan(10, 0, std::vector<double>(21, 10), 0.004);
-    ASSERT_TRUE(sample);
-    EXPECT_NEAR(sample->position, 10, 1e-9);
-    EXPECT_NEAR(sample->velocity, 0, 1e-9);
-    EXPECT_NEAR(sample->acceleration, 0, 1e-9);
+    const auto hold = mpc.plan(10, std::vector<double>(21, 10));
+    ASSERT_TRUE(hold);
+    EXPECT_NEAR(hold->position, 10, 1e-6);
+    const auto step = mpc.plan(0, std::vector<double>(21, 10));
+    ASSERT_TRUE(step);
+    EXPECT_GT(step->position, 1.0);
+    EXPECT_LE(step->position, config.max_command_lead);
+    EXPECT_DOUBLE_EQ(step->velocity, 0);
+    EXPECT_DOUBLE_EQ(step->acceleration, 0);
 }
 
-TEST(AxisMpc, stepUsesOneConsistentBoundedTrajectory) {
+TEST(AngleCommandMpc, boundsBothDirectionsAndCrossesSeam) {
     AxisMpc::Config config;
+    config.max_command_lead = 5;
     AxisMpc mpc(config);
-    for (const auto goal : {-90.0, -10.0, 10.0, 90.0}) {
-        const auto sample = mpc.plan(0, 0, std::vector<double>(21, goal), 0.004);
-        ASSERT_TRUE(sample) << goal;
-        EXPECT_GT(sample->acceleration * goal, 0);
-        EXPECT_LE(std::abs(sample->acceleration), config.max_acceleration);
-        EXPECT_LE(std::abs(sample->velocity), config.max_velocity);
-        EXPECT_NEAR(sample->velocity, sample->acceleration * 0.004, 1e-9);
-        EXPECT_NEAR(sample->position, 0.5 * sample->acceleration * 0.004 * 0.004, 1e-9);
+    for (double goal : {-30.0, 30.0}) {
+        const auto step = mpc.plan(0, std::vector<double>(21, goal));
+        ASSERT_TRUE(step);
+        EXPECT_GT(step->position * goal, 0);
+        EXPECT_LE(std::abs(step->position), 5);
     }
+    const auto seam = mpc.plan(179, std::vector<double>(21, 181));
+    ASSERT_TRUE(seam);
+    EXPECT_GT(seam->position, 179);
+    EXPECT_LE(seam->position, 184);
 }
 
-TEST(AxisMpc, tracksConstantVelocityWithoutInventedAcceleration) {
+TEST(AngleCommandMpc, settlesThroughPositionControllerModel) {
     AxisMpc::Config config;
     AxisMpc mpc(config);
-    std::vector<double> reference(21);
-    for (int i = 0; i <= 20; ++i) reference[i] = 5 + 30 * i * config.dt;
-    const auto sample = mpc.plan(5, 30, reference, 0.004);
-    ASSERT_TRUE(sample);
-    EXPECT_NEAR(sample->position, 5.12, 1e-8);
-    EXPECT_NEAR(sample->velocity, 30, 1e-8);
-    EXPECT_NEAR(sample->acceleration, 0, 1e-8);
-}
-
-TEST(AxisMpc, deceleratesAndSettlesInClosedLoop) {
-    AxisMpc::Config config;
-    AxisMpc mpc(config);
-    double position = 0;
-    double velocity = 0;
-    const std::vector<double> reference(21, 20);
-    for (int i = 0; i < 500; ++i) {
-        const auto sample = mpc.plan(position, velocity, reference, 0.004);
-        ASSERT_TRUE(sample) << i;
-        EXPECT_LE(std::abs(sample->velocity), config.max_velocity);
-        EXPECT_LE(std::abs(sample->acceleration), config.max_acceleration);
-        position = sample->position;
-        velocity = sample->velocity;
+    double actual = 0;
+    const double alpha = -std::expm1(-0.004 / config.response_time);
+    for (int i = 0; i < 250; ++i) {
+        const auto step = mpc.plan(actual, std::vector<double>(21, 10));
+        ASSERT_TRUE(step) << i;
+        EXPECT_LE(std::abs(step->position - actual), config.max_command_lead);
+        actual += alpha * (step->position - actual);
     }
-    EXPECT_NEAR(position, 20, 0.05);
-    EXPECT_NEAR(velocity, 0, 0.1);
+    EXPECT_NEAR(actual, 10, 0.01);
 }
 
-TEST(AxisMpc, respectsVelocityBoundaryAndDifferentPitchLimits) {
+TEST(AngleCommandMpc, rejectsInvalidResponseAndExhaustedBudget) {
     AxisMpc::Config config;
-    config.max_velocity = 100;
-    config.max_acceleration = 300;
-    AxisMpc mpc(config);
-    const auto sample = mpc.plan(0, 100, std::vector<double>(21, 90), 0.004);
-    ASSERT_TRUE(sample);
-    EXPECT_LE(sample->velocity, 100);
-    EXPECT_LE(std::abs(sample->acceleration), 300);
-}
-
-TEST(AxisMpc, crossesYawSeamByShortestPath) {
-    EXPECT_DOUBLE_EQ(unwrap_degrees(-179, 179), 181);
-    EXPECT_DOUBLE_EQ(unwrap_degrees(179, -179), -181);
-    AxisMpc::Config config;
-    AxisMpc mpc(config);
-    const auto sample = mpc.plan(179, 0, std::vector<double>(21, 181), 0.004);
-    ASSERT_TRUE(sample);
-    EXPECT_GT(sample->acceleration, 0);
-    EXPECT_LT(sample->position - 179, 1);
-}
-
-TEST(AxisMpc, solvesVariedFeasibleReferences) {
-    std::mt19937 random(2026);
-    std::uniform_real_distribution<double> unit(-1, 1);
-    for (const auto max_velocity : {100.0, 720.0}) {
-        AxisMpc::Config config;
-        config.max_velocity = max_velocity;
-        config.max_acceleration = max_velocity * 5;
-        // 极端随机参考单独验证充分迭代后的可行性；实时预算耗尽由失败测试覆盖。
-        config.max_iterations = 30000;
-        AxisMpc mpc(config);
-        for (int i = 0; i < 100; ++i) {
-            const double position = 180 * unit(random);
-            const double velocity = max_velocity * unit(random);
-            const double goal = position + 180 * unit(random);
-            const auto sample = mpc.plan(position, velocity, std::vector<double>(21, goal), 0.004);
-            ASSERT_TRUE(sample) << i << " " << max_velocity;
-            EXPECT_LE(std::abs(sample->velocity), max_velocity);
-            EXPECT_LE(std::abs(sample->acceleration), config.max_acceleration);
-        }
-    }
-}
-
-TEST(AxisMpc, switchingReferenceDoesNotKeepPreviousDualState) {
-    AxisMpc::Config config;
-    AxisMpc reused(config);
-    AxisMpc fresh(config);
-    ASSERT_TRUE(reused.plan(0, 0, std::vector<double>(21, 30), 0.004));
-    const auto switched = reused.plan(0, 0, std::vector<double>(21, -30), 0.004);
-    const auto expected = fresh.plan(0, 0, std::vector<double>(21, -30), 0.004);
-    ASSERT_TRUE(switched);
-    ASSERT_TRUE(expected);
-    EXPECT_NEAR(switched->acceleration, expected->acceleration, 1e-9);
-    EXPECT_LT(switched->acceleration, 0);
-}
-
-TEST(AxisMpc, rejectsExtremeReferenceWhenRealtimeBudgetIsExhausted) {
-    AxisMpc::Config config;
-    config.max_velocity = 100;
-    config.max_acceleration = 500;
-    AxisMpc realtime(config);
-    EXPECT_FALSE(realtime.plan(152.332, -0.671643, std::vector<double>(21, 279.595), 0.004));
-    config.max_iterations = 30000;
-    AxisMpc extended(config);
-    const auto result = extended.plan(152.332, -0.671643,
-                                      std::vector<double>(21, 279.595), 0.004);
-    ASSERT_TRUE(result);
-    EXPECT_LE(std::abs(result->velocity), config.max_velocity);
-    EXPECT_LE(std::abs(result->acceleration), config.max_acceleration);
-}
-
-TEST(AxisMpc, rejectsBadInputsAndUnconvergedOptimization) {
-    AxisMpc::Config config;
-    AxisMpc mpc(config);
-    auto reference = std::vector<double>(21, 0);
-    EXPECT_FALSE(mpc.plan(0, 721, reference, 0.004));
-    EXPECT_FALSE(mpc.plan(0, 0, reference, 0.02));
-    reference[4] = std::numeric_limits<double>::quiet_NaN();
-    EXPECT_FALSE(mpc.plan(0, 0, reference, 0.004));
-    EXPECT_FALSE(mpc.plan(0, 0, {}, 0.004));
+    config.response_time = 0;
+    AxisMpc invalid(config);
+    EXPECT_FALSE(invalid.plan(0, std::vector<double>(21, 10)));
+    config.response_time = 0.06;
     config.max_iterations = 1;
     AxisMpc limited(config);
-    EXPECT_FALSE(limited.plan(0, 0, std::vector<double>(21, 90), 0.004));
+    EXPECT_FALSE(limited.plan(0, std::vector<double>(21, 30)));
+}
+TEST(AngleCommandMpc, comparesAngleOnlyPlantAgainstDirect) {
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        double errors[2] = {};
+        double final_angles[2] = {};
+        double first_commands[2] = {};
+        for (int mode = 0; mode < 2; ++mode) {
+            AxisMpc::Config config;
+            AxisMpc mpc(config);
+            double actual = 0;
+            const double period = 0.004;
+            const double alpha = -std::expm1(-period / 0.06);
+            for (int i = 0; i < 250; ++i) {
+                const auto goal = [scenario](double t) {
+                    if (scenario == 0) return 10.0;
+                    if (scenario == 1) return 20.0 * t;
+                    return 10.0 * std::sin(2.0 * 3.141592653589793 * t);
+                };
+                std::vector<double> reference(21);
+                for (int k = 0; k <= 20; ++k)
+                    reference[k] = goal(i * period + k * config.dt);
+                double command = reference[0];
+                if (mode != 0) {
+                    const auto step = mpc.plan(actual, reference);
+                    ASSERT_TRUE(step) << scenario << " " << mode << " " << i;
+                    command = step->position;
+                }
+                if (i == 0) first_commands[mode] = command;
+                actual += alpha * (command - actual);
+                const double error = actual - goal((i + 1) * period);
+                errors[mode] += error * error;
+            }
+            final_angles[mode] = actual;
+        }
+        std::cout << "ANGLE_COMPARISON scenario=" << scenario
+                  << " direct/angle RMSE=";
+        for (double error : errors) std::cout << std::sqrt(error / 250) << " ";
+        std::cout << " final=";
+        for (double angle : final_angles) std::cout << angle << " ";
+        std::cout << " first_command=";
+        for (double command : first_commands) std::cout << command << " ";
+        std::cout << std::endl;
+    }
+}
+TEST(AngleCommandMpc, rejectsInvalidInputsAndConfiguration) {
+    AxisMpc::Config config;
+    AxisMpc mpc(config);
+    EXPECT_FALSE(mpc.plan(0, {}));
+    auto reference = std::vector<double>(21, 0);
+    reference[3] = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(mpc.plan(0, reference));
+    EXPECT_FALSE(mpc.plan(std::numeric_limits<double>::infinity(), std::vector<double>(21, 0)));
     config.dt = 0;
     AxisMpc invalid(config);
-    EXPECT_FALSE(invalid.plan(0, 0, std::vector<double>(21, 0), 0.004));
+    EXPECT_FALSE(invalid.plan(0, std::vector<double>(21, 0)));
 }
 } // namespace qd::auto_aim

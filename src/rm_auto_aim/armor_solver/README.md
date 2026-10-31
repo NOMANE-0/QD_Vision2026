@@ -1,113 +1,51 @@
 # armor_solver
 
-## 装甲板 MPC 与 V2
+## 装甲板角度 MPC 与 V2
 
-现有选板和弹道求解之后接入两轴有限时域约束 MPC。每轴采用
-`p[k+1]=p[k]+v[k]·dt+0.5·a[k]·dt²`、`v[k+1]=v[k]+a[k]·dt`，
-优化整个时域的加速度序列，代价包含角度跟踪、速度跟踪及加速度幅值。
-使用从本地济瞄 `sp_vision_25` 引入的 TinyMPC（ADMM）求解器处理全时域速度与加速度约束。
-源码位于 `third_party/tinympc`，通过包内静态库链接，不依赖系统安装的 TinyMPC。
-活动集求解实现已移除；求解未收敛或未投影轨迹越界时参考无效。
+`solver.mpc.mode` 仅支持 `angle_command`（默认）和 `direct`。旧加速度轨迹模式已删除，其他模式值在节点构造时报告配置错误。
 
-每次从新鲜 V2 姿态与实际角速度重新初始化，固定当前选中的装甲板预测未来各点，
-逐点计算弹道和手动补偿后的角度。Pitch 在规划边界统一为向下为正；Yaw 展开以跨越
-±180°。不对相邻图像的选板跳变差分，切换目标或重捕获时不沿用上一目标的控制序列。
-间接击打保留选板器的等待时间，并随预测时刻消耗等待时间。
+- `angle_command`：TinyMPC 直接优化绝对角度指令，使用一阶位置闭环模型 `actual[k+1]=(1-alpha)*actual[k]+alpha*command[k]`，其中 `alpha=1-exp(-dt/response_time)`。发送首个控制角度，每周期重新规划。
+- `direct`：使用相同弹道预测链路，直接发送参考首点，仍检查目标、反馈、弹道和坐标系。
 
-`GimbalCmd.yaw/pitch` 为 MPC 输出角度，四个 `*_deg_s`/`*_deg_s2` 字段是同一首区间
-采样时刻的速度和加速度；`exp_yaw/exp_pitch` 仍是原始弹道瞄准角，
-`yaw_vel/pitch_vel` 仍保留旧几何速度调试语义，不能替代 MPC 字段。
-`target_v_yaw` 始终来自目标消息的敌方自转速度，单位 rad/s。
+两种模式的速度、加速度前馈字段均为零，下位机使用绝对 yaw/pitch。实际角速度反馈用于将采样姿态外推到当前时刻。yaw 连续展开后规划，发送时归一化；pitch 保留协议范围检查。
+`exp_yaw/exp_pitch` 保留原始瞄准角，`yaw_vel/pitch_vel` 保留几何速度调试含义。`target_v_yaw` 是敌方自转速度，单位 rad/s。
 
-MPC 用反馈采样年龄加 `predict2send_delay` 将反馈姿态按实际速度外推至参考起点。
-目标预测包含图像年龄、`predict2send_delay` 和子弹飞行时间；`additional_prediction_time`
-只用于前移目标参考，不在 MPC 输出端再次叠加速度。
-输出 `header.stamp` 为求解开始时刻加 `predict2send_delay + sample_time`。
-V2 没有视觉参考时间戳，实际部署须标定延迟并与电控约定执行时刻；不能重复补偿。
+原有火控条件之外，检查实际反馈与瞄准参考首点的误差；指令领先不表示实际枪口对准。求解失败输出无效参考，不自动切换直发。
 
-只有目标与反馈新鲜、坐标系一致、模式为装甲板、弹道和两轴优化成功时，才设置
-`reference_valid=true`。速度反馈超过配置上限时拒绝规划，不截断测速伪装可行。
-若开启弹道补偿但弹速缺失或弹道失败，参考无效；关闭弹道补偿时允许几何角跟踪，
-开火建议仍需要有效弹速。原有火控外再检查规划输出与瞄准点的偏差，尚未跟上时不建议开火。
-能量机关不在本次 MPC 覆盖范围。
+### 参数
 
-### 默认参数与状态
+配置文件为 `rm_bringup/config/node_params/armor_solver_params.yaml`，修改后重启节点。两种模式均保持 `enabled=true`；关闭会输出无效参考。
 
-参数位于 `solver.mpc`，修改后重启节点。`enabled=false` 会发送无效参考，不回退到 V1。
-
-| 参数 | 默认值 | 含义 |
+| 参数 | 当前值 | 含义 |
 | --- | --- | --- |
+| mode | angle_command | 角度规划；direct 为直发对照 |
 | horizon / dt | 20 / 0.01 s | 0.2 s 预测时域 |
-| sample_time | 0.004 s | 首控制区间的输出时刻，对应250 Hz求解周期 |
-| position_weight / velocity_weight / acceleration_weight | 1 / 0.002 / 0.00001 | 跟踪与控制代价 |
-| max_iterations / tolerance | 3000 / 0.00001 | TinyMPC ADMM 迭代上限、缩放变量的残差容差 |
-| yaw.max_velocity / max_acceleration | 720 °/s / 6000 °/s² | Yaw 初始约束 |
-| pitch.max_velocity / max_acceleration | 360 °/s / 3000 °/s² | Pitch 初始约束 |
-| feedback_timeout / target_timeout | 0.1 s / 0.3 s | 按采样时间判断新鲜度 |
+| position_weight / command_weight | 1 / 0.05 | 实际角跟踪与指令偏离参考的代价 |
+| yaw.response_time / pitch.response_time | 0.06 / 0.08 s | 一阶闭环时间常数，试验初值，需辨识 |
+| yaw.max_command_lead / pitch.max_command_lead | 10 / 5 degree | 相对本轮当前姿态估计的指令幅度上限 |
+| max_iterations / tolerance | 3000 / 0.00001 | ADMM 迭代上限与容差 |
+| feedback_timeout / target_timeout | 0.1 / 0.3 s | 采样新鲜度检查 |
 
-以上约束是联调初始值，未证明符合实车能力；机械限位和电控保护仍由电控实现。
-TinyMPC 内部按权重平方根缩放变量，速度和控制额外放大10倍，代价同步换算以保持物理权重。
-ADMM rho 固定为 1；每次规划重置迭代状态，避免目标切换继承旧控制。
-在参考末端切线的匀速坐标中规划，使匀速参考不会因终端代价产生虚假制动。
-采用 TinyMPC 的终端代价，因此数值结果不保证与原活动集有限时域代价一致。
-来源代码的 ADMM rho 重复叠加已修正，Riccati 预计算精度也已收紧，详见来源记录。
-随机极端参考测试单独使用30000次迭代；默认实时预算3000次不保证覆盖所有极端场景。
-达到迭代上限会输出无效参考；实车必须测量两轴规划和弹道生成的总耗时，不能据独立测试认定达到250 Hz。
-保留奇点的实际反馈初始化、含半加速度项的双积分模型及首区间输出，
-并非复现济瞄整套参考初始化及中点输出。
-这是一版双积分参考规划器，不是已经辨识并验证过的电机动力学模型。
-完整弹道时域生成在节点求解线程中执行，250 Hz 的实际耗时需要在目标机测量。
+指令幅度上限不是相邻帧变化率约束，也不保证真实电机速度或加速度。
+旧速度/加速度权重、上限及首区间采样参数已删除。
+输出时间戳为求解时间加 `predict2send_delay`。该参数仍参与目标预测，但当前一阶模型未包含纯输入延迟队列，不应与闭环响应重复补偿。模型尚未包含历史指令、二阶惯性或变化率惩罚，参数及实车效果需联合实测。
 
-检查 `armor_solver/cmd_gimbal.reference_status`：
+### 验证与部署
 
-| 状态 | 含义 |
-| --- | --- |
-| valid | 完整规划成功，可以由串口编码为有效参考 |
-| no_target / no_feedback | 无目标或尚未收到 V2 反馈 |
-| stale_target / stale_feedback | 图像目标或反馈采样过期 |
-| not_armor_mode / frame_mismatch | 当前任务或反馈坐标系不匹配 |
-| ballistic_failed | 开启弹道补偿，但未来轨迹存在求解失败 |
-| yaw_mpc_failed / pitch_mpc_failed | 对应轴输入、约束或优化未通过 |
-| invalid_mpc_config / invalid_target / invalid_prediction / invalid_reference | 参数或预测非法 |
-| wire_float_overflow / pitch_out_of_wire_range | 超出串口表示范围 |
-| mpc_disabled / solver_exception | 配置关闭或求解异常 |
+单轴测试覆盖保持、幅度限制、yaw 接缝、一阶闭环收敛、非法输入及预算耗尽，模拟对照只保留直发和角度 MPC。ROS 集成测试同步覆盖角度输出、切换、反馈过期和直发。
+当前环境没有 Docker，完整 ROS 构建、集成测试和实车效果未验证。
 
-核心回归测试覆盖静止、阶跃、匀速、闭环收敛、速度边界、Yaw 跨界、随机可行场景和失败分支。
-ROS 集成测试覆盖弹道 Pitch、完整参考、目标切换、采样过期、模式及坐标系。
-
-
-### TinyMPC 替换验证（2026-10-30）
-
-独立使用 `g++ -std=c++17 -O3 -Wall -Werror` 编译适配器及 TinyMPC 三个运行源文件，
-链接 gtest，10项测试全部通过：静止、阶跃、一致p/v/a、匀速、闭环收敛、速度边界、
-Yaw跨界、200组随机参考、切换参考状态隔离、预算耗尽/非法输入。
-随机压力测试使用30000次迭代，其余使用默认3000次（单迭代失败测试除外）。
-专门保留一个默认预算失败、提高预算后成功的场景，避免把有限预算等同于保证收敛。
-
-当前开发环境无 Docker、ROS Humble，尚未执行完整ROS集成编译与集成测试。
-在已配置ROS的仓库容器 `/ros_ws` 中执行：
+在仓库容器内执行：
 
 ```bash
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-up-to armor_solver --parallel-workers 4
+colcon build --symlink-install --packages-select armor_solver
 source install/setup.bash
 colcon test --packages-select armor_solver
 colcon test-result --verbose
 ```
 
-开发机独立单轴耗时检查（每场景200次，初始角度/速度为0；单位ms）：
-
-| 固定参考角 | 中位耗时 | P95 | 最大值 |
-| --- | --- | --- | --- |
-| 0° | 0.002 | 0.002 | 0.017 |
-| 2° | 0.920 | 1.396 | 2.553 |
-| 20° | 1.137 | 1.834 | 5.307 |
-| 90° | 0.495 | 0.798 | 1.824 |
-
-这不是实车性能承诺，也不包含另一轴、未来弹道生成、ROS调度或串口延迟。
-联调先记录 `reference_status`、实际解算频率和总耗时，再调整迭代预算与容差。
-静止参考抖动和实际云台振荡尚未通过硬件验证；原 `predict2send_delay: 0.11` 仍需标定。
-
+上车先禁止开火，用 `direct` 做小幅阶跃及匀速往返，记录发送角、实际反馈、角速度和时间戳，分别辨识两轴响应与纯延迟；再用 `angle_command` 对照实际角误差、振荡、反向恢复及求解耗时。直发对照只需切换 mode 并重启。
 
 ## qd::ArmorSolverNode
 

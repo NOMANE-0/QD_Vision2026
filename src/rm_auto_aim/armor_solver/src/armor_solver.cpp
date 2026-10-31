@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace qd::auto_aim {
 Solver::Solver(std::weak_ptr<rclcpp::Node> n): node_(n) {
@@ -81,25 +82,25 @@ Solver::Solver(std::weak_ptr<rclcpp::Node> n): node_(n) {
         angle = angle * M_PI / 180.; // 转弧度制
 
     mpc_enabled_ = node->declare_parameter("solver.mpc.enabled", true);
+    const auto mpc_mode = node->declare_parameter<std::string>("solver.mpc.mode", "angle_command");
+    if (mpc_mode != "angle_command" && mpc_mode != "direct") {
+        throw std::invalid_argument("solver.mpc.mode must be angle_command or direct");
+    }
+    direct_angle_command_ = mpc_mode == "direct";
+    mpc_config_.command_weight = node->declare_parameter("solver.mpc.command_weight", 0.05);
+    mpc_config_.response_time = node->declare_parameter("solver.mpc.yaw.response_time", 0.06);
+    mpc_config_.max_command_lead = node->declare_parameter("solver.mpc.yaw.max_command_lead", 10.0);
     mpc_config_.horizon = node->declare_parameter("solver.mpc.horizon", 20);
     mpc_config_.dt = node->declare_parameter("solver.mpc.dt", 0.01);
     mpc_config_.position_weight = node->declare_parameter("solver.mpc.position_weight", 1.0);
-    mpc_config_.velocity_weight = node->declare_parameter("solver.mpc.velocity_weight", 0.002);
-    mpc_config_.acceleration_weight =
-        node->declare_parameter("solver.mpc.acceleration_weight", 0.00001);
     mpc_config_.max_iterations = node->declare_parameter("solver.mpc.max_iterations", 3000);
     mpc_config_.tolerance = node->declare_parameter("solver.mpc.tolerance", 1e-5);
     feedback_timeout_ = node->declare_parameter("solver.mpc.feedback_timeout", 0.1);
     target_timeout_ = node->declare_parameter("solver.mpc.target_timeout", 0.3);
-    mpc_sample_time_ = node->declare_parameter("solver.mpc.sample_time", 0.004);
-    mpc_config_.max_velocity = node->declare_parameter("solver.mpc.yaw.max_velocity", 720.0);
-    mpc_config_.max_acceleration =
-        node->declare_parameter("solver.mpc.yaw.max_acceleration", 6000.0);
     yaw_mpc_ = std::make_unique<AxisMpc>(mpc_config_);
     auto pitch_config = mpc_config_;
-    pitch_config.max_velocity = node->declare_parameter("solver.mpc.pitch.max_velocity", 360.0);
-    pitch_config.max_acceleration =
-        node->declare_parameter("solver.mpc.pitch.max_acceleration", 3000.0);
+    pitch_config.response_time = node->declare_parameter("solver.mpc.pitch.response_time", 0.08);
+    pitch_config.max_command_lead = node->declare_parameter("solver.mpc.pitch.max_command_lead", 5.0);
     pitch_mpc_ = std::make_unique<AxisMpc>(pitch_config);
 
     node.reset();

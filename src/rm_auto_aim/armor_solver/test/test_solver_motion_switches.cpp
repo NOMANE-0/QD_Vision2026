@@ -13,9 +13,11 @@ protected:
         }
         FYT_REGISTER_LOGGER("armor_solver", "/tmp/qyg-mpc-test-log", INFO);
     }
+    virtual std::string mode() const { return "angle_command"; }
     void SetUp() override {
         rclcpp::NodeOptions options;
         options.parameter_overrides({
+            rclcpp::Parameter("solver.mpc.mode", mode()),
             rclcpp::Parameter("solver.use_armor_top", true),
             rclcpp::Parameter("solver.use_ballistic_compensation", false),
             rclcpp::Parameter("solver.compensator_type", "ideal")});
@@ -67,7 +69,7 @@ TEST_F(SolverMotionSwitches, requiresFeedbackThenPublishesCompleteReference) {
     EXPECT_EQ(command.target_v_yaw, 0);
 }
 
-TEST_F(SolverMotionSwitches, plansBallisticPitchWithMatchingDerivativeSign) {
+TEST_F(SolverMotionSwitches, plansBallisticPitchWithoutDerivativeFeedforward) {
     node_->set_parameter(rclcpp::Parameter("solver.use_ballistic_compensation", true));
     solver_->update_bullet_speed(16);
     solver_->update_feedback(feedback_);
@@ -75,10 +77,8 @@ TEST_F(SolverMotionSwitches, plansBallisticPitchWithMatchingDerivativeSign) {
     ASSERT_TRUE(command.reference_valid) << command.reference_status;
     EXPECT_LT(command.exp_pitch, 0);
     EXPECT_LT(command.pitch, 0);
-    EXPECT_LT(command.pitch_vel_deg_s, 0);
-    EXPECT_LT(command.pitch_acc_deg_s2, 0);
-    EXPECT_NEAR(command.pitch_vel_deg_s, command.pitch_acc_deg_s2 * 0.004, 1e-5);
-    EXPECT_NEAR(command.pitch, 0.5 * command.pitch_acc_deg_s2 * 0.004 * 0.004, 1e-7);
+    EXPECT_DOUBLE_EQ(command.pitch_vel_deg_s, 0);
+    EXPECT_DOUBLE_EQ(command.pitch_acc_deg_s2, 0);
 }
 
 TEST_F(SolverMotionSwitches, targetSwitchUsesFreshOptimizationWithoutDifferencingJump) {
@@ -86,13 +86,13 @@ TEST_F(SolverMotionSwitches, targetSwitchUsesFreshOptimizationWithoutDifferencin
     target_.position_armor.y = 1;
     const auto left = solve();
     ASSERT_TRUE(left.reference_valid) << left.reference_status;
-    EXPECT_GT(left.yaw_acc_deg_s2, 0);
+    EXPECT_GT(left.yaw, 0);
     target_.position_armor.y = -1;
     const auto right = solve();
     ASSERT_TRUE(right.reference_valid) << right.reference_status;
-    EXPECT_LT(right.yaw_acc_deg_s2, 0);
-    EXPECT_LE(std::abs(right.yaw_acc_deg_s2), 6000);
-    EXPECT_LE(std::abs(right.yaw_vel_deg_s), 720);
+    EXPECT_LT(right.yaw, 0);
+    EXPECT_DOUBLE_EQ(right.yaw_acc_deg_s2, 0);
+    EXPECT_DOUBLE_EQ(right.yaw_vel_deg_s, 0);
 }
 
 TEST_F(SolverMotionSwitches, repeatsDoNotRenewFeedbackAndStaleTargetIsRejected) {
@@ -125,5 +125,39 @@ TEST_F(SolverMotionSwitches, rejectsEnergyModeAndFrameMismatch) {
     const auto command = solve();
     EXPECT_EQ(command.reference_status, "frame_mismatch");
     EXPECT_FALSE(command.reference_valid);
+}
+class SolverAngleCommand : public SolverMotionSwitches {
+protected:
+    std::string mode() const override { return "angle_command"; }
+};
+
+TEST_F(SolverAngleCommand, publishesAngleWithZeroFeedforwardAndChecksActualAim) {
+    solver_->update_feedback(feedback_);
+    target_.position_armor.y = 1;
+    const auto command = solve();
+    ASSERT_TRUE(command.reference_valid) << command.reference_status;
+    EXPECT_GT(command.yaw, 1.0);
+    EXPECT_LE(command.yaw, 10.0);
+    EXPECT_DOUBLE_EQ(command.yaw_vel_deg_s, 0);
+    EXPECT_DOUBLE_EQ(command.pitch_vel_deg_s, 0);
+    EXPECT_DOUBLE_EQ(command.yaw_acc_deg_s2, 0);
+    EXPECT_DOUBLE_EQ(command.pitch_acc_deg_s2, 0);
+    EXPECT_FALSE(command.fire_advice);
+}
+
+class SolverDirectAngle : public SolverMotionSwitches {
+protected:
+    std::string mode() const override { return "direct"; }
+};
+
+TEST_F(SolverDirectAngle, publishesValidDirectReference) {
+    solver_->update_feedback(feedback_);
+    target_.position_armor.y = 1;
+    const auto command = solve();
+    ASSERT_TRUE(command.reference_valid) << command.reference_status;
+    EXPECT_EQ(command.reference_status, "valid_direct");
+    EXPECT_GT(command.yaw, 1.0);
+    EXPECT_DOUBLE_EQ(command.yaw_vel_deg_s, 0);
+    EXPECT_DOUBLE_EQ(command.yaw_acc_deg_s2, 0);
 }
 } // namespace qd::auto_aim

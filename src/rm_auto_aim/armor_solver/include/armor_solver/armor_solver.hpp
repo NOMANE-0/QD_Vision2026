@@ -195,9 +195,9 @@ private:
     AxisMpc::Config mpc_config_;
     std::optional<rm_interfaces::msg::SerialReceiveData> feedback_;
     bool mpc_enabled_ = true;
+    bool direct_angle_command_ = false;
     double feedback_timeout_ = 0.1;
     double target_timeout_ = 0.3;
-    double mpc_sample_time_ = 0.004;
 
     std::unique_ptr<TrajectoryCompensator> trajectory_compensator_;
     std::unique_ptr<ManualCompensator> manual_compensator_;

@@ -43,8 +43,7 @@ bool Solver::plan_mpc(const ShootState& aim, const rm_interfaces::msg::Target& t
     }
     if (mpc_config_.horizon < 2 || mpc_config_.horizon > 100
         || !std::isfinite(mpc_config_.dt) || mpc_config_.dt <= 0.0
-        || !std::isfinite(mpc_sample_time_) || mpc_sample_time_ <= 0.0
-        || mpc_sample_time_ > mpc_config_.dt || !std::isfinite(feedback_timeout_)
+        || !std::isfinite(feedback_timeout_)
         || feedback_timeout_ <= 0.0 || !std::isfinite(target_timeout_)
         || target_timeout_ <= 0.0 || !std::isfinite(predict2send_delay_)
         || predict2send_delay_ < 0.0 || !std::isfinite(additional_prediction_time)
@@ -69,10 +68,12 @@ bool Solver::plan_mpc(const ShootState& aim, const rm_interfaces::msg::Target& t
     }
 
     constexpr double RAD_TO_DEG = 180.0 / M_PI;
-    const double feedback_lead = feedback_age + predict2send_delay_;
-    const double yaw_initial = feedback_->yaw + feedback_->yaw_actual_vel_deg_s * feedback_lead;
+    // 用反馈角速度将采样姿态外推到当前时刻。
+    const double yaw_initial = feedback_->yaw + feedback_->yaw_actual_vel_deg_s
+        * feedback_age;
     const double pitch_initial = feedback_->pitch
-        + feedback_->pitch_actual_vel_deg_s * feedback_lead;
+        + feedback_->pitch_actual_vel_deg_s
+            * feedback_age;
     std::vector<double> yaw_reference;
     std::vector<double> pitch_reference;
     yaw_reference.reserve(mpc_config_.horizon + 1);
@@ -110,13 +111,29 @@ bool Solver::plan_mpc(const ShootState& aim, const rm_interfaces::msg::Target& t
     if (!std::isfinite(command_distance) || command_distance < 0.01) {
         return reject("invalid_target");
     }
-    const auto yaw_plan = yaw_mpc_->plan(yaw_initial, feedback_->yaw_actual_vel_deg_s,
-                                         yaw_reference, mpc_sample_time_);
+    if (direct_angle_command_) {
+        command.yaw = std::remainder(yaw_reference[0], 360.0);
+        command.pitch = pitch_reference[0];
+        command.distance = command_distance;
+        command.yaw_diff = std::remainder(command.yaw - feedback_->yaw, 360.0);
+        command.pitch_diff = command.pitch - feedback_->pitch;
+        command.header.stamp = now + rclcpp::Duration::from_seconds(predict2send_delay_);
+        command.reference_valid = true;
+        command.reference_status = "valid_direct";
+        const double yaw_tolerance = std::atan2(shooting_range_w_ * 0.5
+            * max_out_error[top_level], command_distance) * RAD_TO_DEG;
+        const double pitch_tolerance = std::atan2(shooting_range_h_ * 0.5
+            * max_out_error[top_level], command_distance) * RAD_TO_DEG;
+        command.fire_advice = command.fire_advice
+            && std::abs(command.yaw_diff) <= yaw_tolerance
+            && std::abs(command.pitch_diff) <= pitch_tolerance;
+        return true;
+    }
+    const auto yaw_plan = yaw_mpc_->plan(yaw_initial, yaw_reference);
     if (!yaw_plan) {
         return reject("yaw_mpc_failed");
     }
-    const auto pitch_plan = pitch_mpc_->plan(pitch_initial, feedback_->pitch_actual_vel_deg_s,
-                                             pitch_reference, mpc_sample_time_);
+    const auto pitch_plan = pitch_mpc_->plan(pitch_initial, pitch_reference);
     if (!pitch_plan) {
         return reject("pitch_mpc_failed");
     }
@@ -138,21 +155,21 @@ bool Solver::plan_mpc(const ShootState& aim, const rm_interfaces::msg::Target& t
     command.yaw_diff = std::remainder(command.yaw - feedback_->yaw, 360.0);
     command.pitch_diff = command.pitch - feedback_->pitch;
     command.header.stamp = now + rclcpp::Duration::from_seconds(
-        predict2send_delay_ + mpc_sample_time_);
+        predict2send_delay_);
     command.reference_valid = true;
     command.reference_status = "valid";
-    // 原有火控条件之外，规划轨迹尚未跟上瞄准点时禁止建议开火。
-    const double fraction = mpc_sample_time_ / mpc_config_.dt;
-    const double yaw_goal = yaw_reference[0] + fraction * (yaw_reference[1] - yaw_reference[0]);
-    const double pitch_goal = pitch_reference[0]
-        + fraction * (pitch_reference[1] - pitch_reference[0]);
+    const double yaw_goal = yaw_reference[0];
+    const double pitch_goal = pitch_reference[0];
     const double yaw_tolerance = std::atan2(shooting_range_w_ * 0.5
         * max_out_error[top_level], command_distance) * RAD_TO_DEG;
     const double pitch_tolerance = std::atan2(shooting_range_h_ * 0.5
         * max_out_error[top_level], command_distance) * RAD_TO_DEG;
+    // 角度指令允许领先，开火必须检查实际反馈而不是发送指令是否对准。
+    const double fire_yaw = feedback_->yaw;
+    const double fire_pitch = feedback_->pitch;
     command.fire_advice = command.fire_advice
-        && std::abs(std::remainder(yaw_plan->position - yaw_goal, 360.0)) <= yaw_tolerance
-        && std::abs(pitch_plan->position - pitch_goal) <= pitch_tolerance;
+        && std::abs(std::remainder(fire_yaw - yaw_goal, 360.0)) <= yaw_tolerance
+        && std::abs(fire_pitch - pitch_goal) <= pitch_tolerance;
     return true;
 }
 } // namespace qd::auto_aim
