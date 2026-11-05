@@ -55,6 +55,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_fixed_packet_tool test/test_fixed_packet_tool.cpp)
   target_link_libraries(test_fixed_packet_tool ${PROJECT_NAME})
+
+  ament_add_gtest(test_feedback_timing test/test_feedback_timing.cpp)
+  target_link_libraries(test_feedback_timing ${PROJECT_NAME})
 endif()
 
 #############

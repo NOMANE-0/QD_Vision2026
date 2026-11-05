@@ -20,6 +20,7 @@
 #define ARMOR_SOLVER_TRACKER_HPP_
 
 // std
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <string>
@@ -100,6 +101,7 @@ private:
 
     int detect_count_;
     int lost_count_;
+    std::int64_t last_matched_stamp_ns_ = 0;
 
     // 状态机
     qd::utils::VisionStateMachine& state_machine_;

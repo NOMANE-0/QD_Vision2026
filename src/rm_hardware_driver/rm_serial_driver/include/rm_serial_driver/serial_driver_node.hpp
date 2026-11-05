@@ -25,6 +25,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 // project
 #include "rm_utils/heartbeat.hpp"
@@ -32,6 +33,7 @@
 #include "rm_interfaces/msg/serial_receive_data.hpp"
 #include "rm_interfaces/srv/set_mode.hpp"
 #include "rm_serial_driver/fixed_packet_tool.hpp"
+#include "rm_serial_driver/feedback_pose_aligner.hpp"
 #include "rm_serial_driver/protocol.hpp"
 #include "rm_serial_driver/protocol_factory.hpp"
 #include "rm_serial_driver/transporter_interface.hpp"
@@ -76,6 +78,8 @@ private:
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   // Publisher
   rclcpp::Publisher<rm_interfaces::msg::SerialReceiveData>::SharedPtr serial_receive_data_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr yaw_data_age_pub_;
+  FeedbackPoseAligner feedback_pose_aligner_;
 
   // Broadcast tf from odom to gimbal_link
   double timestamp_offset_ = 0;

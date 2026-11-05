@@ -28,7 +28,14 @@ public:
 
   void send(const rm_interfaces::msg::GimbalCmd &data) override;
 
+  /**
+   * @brief 接收并解析 QD 电控的 16 字节小端反馈帧。
+   * @param data 输出角度（度）、弹速（米每秒）和电控时间戳（毫秒）；pitch 抬头为正。
+   * @return 是否收到完整有效帧。
+   */
   bool receive(rm_interfaces::msg::SerialReceiveData &data) override;
+
+  uint8_t get_yaw_timing_byte() const override { return yaw_timing_byte_; }
 
   std::vector<rclcpp::SubscriptionBase::SharedPtr> getSubscriptions(rclcpp::Node::SharedPtr node) override;
 
@@ -39,6 +46,7 @@ public:
 
 private:
   FixedPacketTool<16>::SharedPtr packet_tool_;
+  uint8_t yaw_timing_byte_ = 0;
 };
 }  // namespace qd::serial_driver::protocol
 

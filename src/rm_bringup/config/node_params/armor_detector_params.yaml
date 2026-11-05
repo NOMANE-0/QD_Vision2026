@@ -1,10 +1,11 @@
 /**:
   ros__parameters:
-    debug: false
+    debug: true
     target_frame: odom
     detect_color: 0
     binary_thres: 80
     max_yaw_angle: 60.0
+    startup_skip_detections: 5 # 启动后丢弃前 5 帧有效装甲板结果，空帧不计数
     device: "GPU"
 
     detector: yolo # tradition ：使用opencv识别  yolo : 使用神经网络识别

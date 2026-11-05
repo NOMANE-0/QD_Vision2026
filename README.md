@@ -113,6 +113,43 @@ pixi shell
 
 修改[rm_bringup/config/launch_params.yaml](src/rm_bringup/config/launch_params.yaml)，选择需要启动的功能
 
+当前网口相机的正式内参保存在 `src/rm_bringup/config/camera_info.yaml`（1624×1240），
+手眼外参保存在 `launch_params.yaml`，其中 `rpy` 的顺序为 roll、pitch、yaw，单位为弧度。
+相机序列号、曝光和增益在 `config/node_params/camera_driver_params.yaml` 中设置；
+电控串口与波特率在 `config/node_params/serial_driver_params.yaml` 中设置。
+实体网口相机启动前，launch 会按 `launch_params.yaml` 中的 `camera_network` 配置，
+为 `enp3s0` 添加 `10.99.99.1/24`；容器须使用 host 网络并具备网卡配置权限。
+回放或视频输入模式不会配置网卡。
+
+容器内启动正式自瞄与 Foxglove Bridge：
+
+```bash
+cd /ros_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch rm_bringup bringup_SingleProcess.launch.py
+```
+
+`enable_foxglove_bridge: true` 会同时启动 Bridge。Foxglove 中选择 **Foxglove WebSocket**，
+连接 `ws://视觉主机IP:8765`（本机使用 `ws://localhost:8765`），添加 **Topic Graph** 面板看节点和话题，
+添加 **Image** 面板选择 `/image_raw`，或添加 **3D** 面板查看 `/tf` 和 `/tf_static`。
+当前使用话题订阅相机模式，默认关闭本地 OpenCV 窗口，适合远程调试。
+Docker 使用 host 网络，Bridge 无需额外映射端口。
+当前容器内的 Bridge 在 ROS 图发生变化时更新节点图；若首次连接时 Topic Graph 为空，
+先在 Image 面板订阅 `/image_raw`，使节点连接图刷新。
+
+仅启动 Bridge（已有自瞄进程时使用，避免同一端口重复启动）：
+
+```bash
+ros2 launch rm_bringup foxglove_bridge.launch.py
+# 需要另一个端口时：
+ros2 launch rm_bringup foxglove_bridge.launch.py port:=8766
+```
+
+Bridge 参数保存在 `config/node_params/foxglove_bridge_params.yaml`，
+其中 `connectionGraph` 能力用于节点图。完整 MVS SDK 挂载在 `/opt/MVS` 时，
+正式 launch 会自动优先加载其网口相机传输库。
+
 ```bash
 # 使用 pixi 的话用这行编译
 pixi run build

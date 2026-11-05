@@ -2,9 +2,9 @@
   ros__parameters:
     target_frame: odom
     child_frame_id: gimbal_link
-    timestamp_offset: 0.000
-    port_name: "/dev/rm_usb0"
-    baud_rate: 115200  # 波特率 921600, 115200, 19200, 9600, 4800, 2400, 1200, 300
+    timestamp_offset: 0.008  # 静止装甲板双向转动拟合：相对原值将姿态时间戳后移 44 ms
+    port_name: "/dev/ttyUSB0"
+    baud_rate: 921600  # 与标定时使用的电控串口配置一致
     protocol: "hero"  # ProtocolInfantry: infantry , DefaultProtocol: hero air , ProtocolSentry: sentry
     enable_data_print: false # 改为true将会打印从串口读出来的16进制数据
 

@@ -18,6 +18,8 @@
 
 #include "armor_solver/armor_tracker.hpp"
 
+#include "armor_solver/armor_measurement_gate.hpp"
+
 namespace qd::auto_aim {
 Tracker::Tracker(double max_match_distance, double max_match_yaw_diff):
     tracker_state(TrackerState::LOST),
@@ -48,6 +50,7 @@ void Tracker::init(const Armors::SharedPtr& armors_msg) noexcept {
     }
 
     initEKF(tracked_armor);
+    last_matched_stamp_ns_ = rclcpp::Time(armors_msg->header.stamp).nanoseconds();
     FYT_INFO("armor_solver", "Init EKF!");
 
     tracked_id = tracked_armor.number;
@@ -86,6 +89,7 @@ void Tracker::update(const Armors::SharedPtr& armors_msg) noexcept {
     double best_area = 0;
     Armor best_armor;
     double best_yaw_diff = DBL_MAX;
+    const auto frame_stamp_ns = rclcpp::Time(armors_msg->header.stamp).nanoseconds();
 
     for (const auto& armor: armors_msg->armors) {
         if (armor.number != tracked_id) {
@@ -95,6 +99,23 @@ void Tracker::update(const Armors::SharedPtr& armors_msg) noexcept {
         double yaw = orientationToYaw(armor.pose.orientation);
 
         auto p = armor.pose.position;
+        if (!std::isfinite(yaw) || !std::isfinite(p.x) || !std::isfinite(p.y)
+            || !std::isfinite(p.z))
+        {
+            continue;
+        }
+        if (is_implausible_same_armor_orientation(
+                tracked_armor.pose.position,
+                orientationToYaw(tracked_armor.pose.orientation),
+                last_matched_stamp_ns_,
+                p,
+                yaw,
+                frame_stamp_ns
+            ))
+        {
+            FYT_WARN("armor_solver", "Reject implausible armor yaw jump for {}", armor.number);
+            continue;
+        }
         double center_yaw = std::atan2(p.y, p.x);
         double pitch = std::atan2(p.z, std::sqrt(p.x * p.x + p.y * p.y));
         double distance = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
@@ -112,6 +133,10 @@ void Tracker::update(const Armors::SharedPtr& armors_msg) noexcept {
             double predicted_yaw = reduced_angle(target_state(6) + i * 2.0 * M_PI / armors_num_int);
             double yaw_diff = std::abs(reduced_angle(predicted_yaw - yaw));
 
+            if (yaw_diff > max_match_yaw_diff_) {
+                continue;
+            }
+
             if (mahalanobis < min_mahalanobis) {
                 min_mahalanobis = mahalanobis;
                 min_yaw_diff = yaw_diff;
@@ -119,7 +144,7 @@ void Tracker::update(const Armors::SharedPtr& armors_msg) noexcept {
             }
         }
 
-        // 异常状态，有同 id 却匹配不到
+        // 所有板位都与本帧观测朝向不匹配。
         if (best_offset < 0) {
             FYT_WARN(
                 "armor_solver",
@@ -156,6 +181,7 @@ void Tracker::update(const Armors::SharedPtr& armors_msg) noexcept {
     }
 
     tracked_armor = best_armor;
+    last_matched_stamp_ns_ = frame_stamp_ns;
     choose_yaw_diff = best_yaw_diff;
 
     // 状态约束

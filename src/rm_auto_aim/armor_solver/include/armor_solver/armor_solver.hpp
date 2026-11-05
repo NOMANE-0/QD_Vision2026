@@ -18,7 +18,9 @@
 #define ARMOR_SOLVER_SOLVER_HPP_
 
 // std
+#include <cstdint>
 #include <memory>
+#include <string>
 // ros2
 #include <angles/angles.h>
 #include <tf2_ros/buffer.h>
@@ -134,6 +136,16 @@ public:
 
     int get_top_level() const;
 
+    /** @brief 丢失目标时清除旋转模式及连续观测计数。 */
+    void reset_top_level() noexcept;
+
+    /**
+     * @brief 使用新收到的有效弹速更新滤波状态和弹道模型。
+     * @param raw_bullet_speed 原始反馈弹速，单位米每秒，须为有限正数。
+     * @note 每条新反馈调用一次；调用方须与解算线程互斥访问。
+     */
+    void update_bullet_speed(double raw_bullet_speed);
+
 private:
     std::unique_ptr<TrajectoryCompensator> trajectory_compensator_;
     std::unique_ptr<ManualCompensator> manual_compensator_;
@@ -141,12 +153,27 @@ private:
     std::string gimble_frame_;
 
 private:
-    void update_top_level(const double angular_velocity);
+    /**
+     * @brief 用一张新图像的自转速度更新旋转目标模式。
+     * @param angular_velocity EKF 自转速度，单位弧度每秒。
+     * @param frame_stamp_ns 图像时间戳，单位纳秒；同帧重复解算不累计确认次数。
+     * @param target_id 当前跟踪的装甲板编号。
+     */
+    void update_top_level(
+        double angular_velocity,
+        std::int64_t frame_stamp_ns,
+        const std::string& target_id
+    );
 
     double get_ballistic_flying_time(const Eigen::Vector3d& target_pos);
+    /**
+     * @brief 根据运动预测开关返回当前状态或命中时刻的预测状态。
+     * @param state 当前目标状态，位置为目标参考系中的米，速度为米每秒或弧度每秒。
+     * @param base_delay 图像到发送及控制的固定延迟，单位秒。
+     * @return 预测开启时返回命中状态；关闭时原样返回当前状态。
+     */
     State solve_impact_state(const State& state, double base_delay);
     double get_bullet_speed();
-    void update_bullet_speed(double raw_bullet_speed);
 
     std::vector<State> get_armors_state(const RosTarget& target_msg);
 
@@ -226,11 +253,15 @@ private:
     Eigen::Vector3d gimbal_rpy_; // 当前云台姿态
 
     int top_level; // 运动状态
+    int top_activation_frames_ = 4;
+    int top_activation_count_ = 0;
+    int top_candidate_sign_ = 0;
+    std::int64_t last_top_frame_stamp_ns_ = 0;
+    std::string top_target_id_;
 
     double gravity = 9.8;
     double resistance = 0.001;
-    double bullet_speed = 23;
-    double bullet_speed_receive = 23;
+    double bullet_speed = 16.0;
     double bullet_speed_filter_alpha_ = 0.2;
     bool bullet_speed_filter_initialized_ = false;
 
@@ -252,6 +283,7 @@ private:
     double last_aim_yaw_ = 0.0; // 记录上一帧锁定的装甲板世界 yaw，用于切板滞回
 
     bool use_armor_top_ = false;
+    bool enable_motion_prediction_ = true; // 仅控制解算外推，不修改 EKF 位置和速度估计
 };
 
 } // namespace qd::auto_aim

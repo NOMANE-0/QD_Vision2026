@@ -1,7 +1,7 @@
 # 6mm相机配置
 camera_6mm:
-  enable_DeviceSerialNumber: false # 是否使用序列号查找，只使用一个相机改为 false
-  device_serial_number: "DA4845979"  # 相机序列号
+  enable_DeviceSerialNumber: true # 按序列号选择当前已标定的网口相机
+  device_serial_number: "DA6811392"  # 相机序列号
   camera_info_url: "package://rm_bringup/config/camera_info.yaml"  # 相机内参文件路径
   camera_name: "camera_6mm"  # 相机名称
   target_frame: "camera_optical_frame"  # 目标frame_id
@@ -32,7 +32,7 @@ camera_8mm:
   # 相机参数
   ReverseXY: false        # 相机是否倒置安装
   enable_frame_rate: false # 是否锁帧
-  acquisition_frame_rate: 200.0  # 采集帧率 (Hz)
+  acquisition_frame_rate: 60.0 # 采集帧率 (Hz)
   exposure_time: 1000.0  # 曝光时间 (微秒)
   gain: 1.0  # 增益
   cvt_quality: 1 # Bayer的插值方法  0-快速 1-均衡（默认为均衡） 2-最优 3-最优+

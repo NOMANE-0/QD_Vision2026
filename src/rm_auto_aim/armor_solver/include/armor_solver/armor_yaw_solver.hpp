@@ -191,6 +191,14 @@ public:
     explicit SolveYawPnP(std::weak_ptr<rclcpp::Node> node);
     ~SolveYawPnP() = default;
 
+    /**
+     * @brief 使用图像采样时刻的云台与相机变换拟合装甲板朝向。
+     * @param armors_msg 已转换到目标坐标系的装甲板，本函数更新其朝向。
+     * @param source_header 原始图像的坐标系和采样时间，用于查询全部历史变换。
+     * @param predict_yaw EKF 预测的装甲板朝向，单位 rad，目标坐标系。
+     * @param tracked_id 本次拟合的装甲板编号。
+     * @param tf2_buffer 保存图像时刻变换的共享 TF 缓冲区。
+     */
     void solve(
         const rm_interfaces::msg::Armors::SharedPtr armors_msg,
         const std_msgs::msg::Header& source_header,

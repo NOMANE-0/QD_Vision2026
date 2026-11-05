@@ -19,6 +19,7 @@
 // std
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <thread>
 // ros2
@@ -73,6 +74,9 @@ void SerialDriverNode::init() {
         "serial/receive",
         rclcpp::SensorDataQoS()
     );
+    yaw_data_age_pub_ = this->create_publisher<std_msgs::msg::Float64>(
+        "serial/yaw_data_age_ms", rclcpp::SensorDataQoS()
+    );
 
     // TF broadcaster
     timestamp_offset_ = this->declare_parameter("timestamp_offset", 0.0);
@@ -108,6 +112,8 @@ void SerialDriverNode::listenLoop() {
     while (rclcpp::ok()) {
         rm_interfaces::msg::SerialReceiveData receive_data;
         if (protocol_->receive(receive_data)) {
+            const uint8_t timing_byte = protocol_->get_yaw_timing_byte();
+            const auto yaw_age = decode_yaw_data_age(timing_byte);
             // 获取当前 PC 时间和 MCU 时间（转换为秒）
             rclcpp::Time pc_now = this->now();
             rclcpp::Time real_gimbal_time = pc_now; // 默认使用 PC 时间，后续会通过 PLL 同步调整
@@ -127,7 +133,7 @@ void SerialDriverNode::listenLoop() {
             rclcpp::Time real_gimbal_time(( mcu_time_sec + min_offset) * 1e9, pc_now.get_clock_type()); // 转换为纳秒构造 rclcpp::Time
  */
             // 扔进 PLL 滤波器，获得剃除了所有调度毛刺的完美绝对时间
-            if (receive_data.mcu_timestamp > 0) {
+            if (receive_data.mcu_timestamp > 0 || yaw_age.supported) {
                 double sync_time_sec =
                     time_sync_.sync(receive_data.mcu_timestamp, pc_now.seconds(), false);
 
@@ -141,14 +147,22 @@ void SerialDriverNode::listenLoop() {
                 real_gimbal_time += rclcpp::Duration::from_seconds(timestamp_offset_);
             }
 
-            FYT_DEBUG(
-                "serial_driver",
-                " Serial communication delay: {:.2f} ms",
-                (pc_now - real_gimbal_time).seconds() * 1e3
-            );
-
             receive_data.header.stamp = real_gimbal_time;
             receive_data.header.frame_id = target_frame_;
+
+            std_msgs::msg::Float64 age_msg;
+            // NaN 表示旧电控没有上报年龄；127 表示新电控姿态缺失或过期。
+            age_msg.data = yaw_age.supported ? static_cast<double>(yaw_age.milliseconds)
+                                             : std::numeric_limits<double>::quiet_NaN();
+            yaw_data_age_pub_->publish(age_msg);
+            const auto pose = feedback_pose_aligner_.update(
+                real_gimbal_time.nanoseconds(),
+                receive_data.mcu_timestamp,
+                receive_data.roll,
+                receive_data.pitch,
+                receive_data.yaw,
+                timing_byte
+            );
 
             state_machine_.setVisionMode(
                 static_cast<VisionMode>(receive_data.mode)
@@ -159,25 +173,27 @@ void SerialDriverNode::listenLoop() {
                 }
             }
 
-            geometry_msgs::msg::TransformStamped t;
-            t.header.stamp = real_gimbal_time;
-            t.header.frame_id = target_frame_;
-            t.child_frame_id = child_frame_id_;
-            auto roll = receive_data.roll * M_PI / 180.0;
-            auto pitch = -receive_data.pitch * M_PI / 180.0;
-            auto yaw = receive_data.yaw * M_PI / 180.0;
-            tf2::Quaternion q;
-            q.setRPY(roll, pitch, yaw);
-            t.transform.rotation = tf2::toMsg(q);
-            tf_broadcaster_->sendTransform(t);
+            if (pose) {
+                geometry_msgs::msg::TransformStamped t;
+                t.header.stamp = rclcpp::Time(pose->stamp_ns, pc_now.get_clock_type());
+                t.header.frame_id = target_frame_;
+                t.child_frame_id = child_frame_id_;
+                auto roll = pose->roll_deg * M_PI / 180.0;
+                auto pitch = -pose->pitch_deg * M_PI / 180.0;
+                auto yaw = pose->yaw_deg * M_PI / 180.0;
+                tf2::Quaternion q;
+                q.setRPY(roll, pitch, yaw);
+                t.transform.rotation = tf2::toMsg(q);
+                tf_broadcaster_->sendTransform(t);
 
-            // odom_rectify: 转了roll角后的坐标系
-            Eigen::Quaterniond q_eigen(q.w(), q.x(), q.y(), q.z());
-            Eigen::Vector3d rpy = utils::getRPY(q_eigen.toRotationMatrix());
-            q.setRPY(rpy[0], 0, 0);
-            t.header.frame_id = target_frame_;
-            t.child_frame_id = target_frame_ + "_rectify";
-            tf_broadcaster_->sendTransform(t);
+                // odom_rectify: 转了roll角后的坐标系
+                Eigen::Quaterniond q_eigen(q.w(), q.x(), q.y(), q.z());
+                Eigen::Vector3d rpy = utils::getRPY(q_eigen.toRotationMatrix());
+                q.setRPY(rpy[0], 0, 0);
+                t.header.frame_id = target_frame_;
+                t.child_frame_id = target_frame_ + "_rectify";
+                tf_broadcaster_->sendTransform(t);
+            }
 
             serial_receive_data_pub_->publish(
                 std::make_unique<rm_interfaces::msg::SerialReceiveData>(std::move(receive_data))

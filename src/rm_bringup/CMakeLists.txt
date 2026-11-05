@@ -8,6 +8,7 @@ find_package(ament_cmake_python REQUIRED)
 install(PROGRAMS
   scripts/dynamic_camera_tf.py
   scripts/calibrate_gimbal2camera_pitch.py
+  scripts/record_camera_video.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

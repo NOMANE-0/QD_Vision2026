@@ -300,30 +300,8 @@ void VisionStateMachine::updateTargetDistance(double distance) {
 }
 
 void VisionStateMachine::updateCameraSwitchLogic() {
-    double distance = last_target_distance_.get();
-    CameraType current_type = current_camera_type_.get();
-    TrackerState tracker_state = current_tracker_state_.get();
-
-    // 如果目标丢失，切换回近距离相机
-    if (tracker_state == TrackerState::LOST) {
-        if (current_type == CameraType::CAMERA_FAR_RANGE) {
-            switchCamera(CameraType::CAMERA_NEAR_RANGE);
-        }
-        return;
-    }
-
-    // 根据距离切换相机
-    const auto& config_near_range = camera_configs_[CameraType::CAMERA_NEAR_RANGE];
-    const auto& config_far_range = camera_configs_[CameraType::CAMERA_FAR_RANGE];
-
-    if (distance > config_near_range.switch_to_8mm_distance
-        && current_type == CameraType::CAMERA_NEAR_RANGE)
-    {
-        // 距离较远，切换到远距离相机以获得更好的精度
-        switchCamera(CameraType::CAMERA_FAR_RANGE);
-    } else if (distance < config_far_range.switch_to_6mm_distance && current_type == CameraType::CAMERA_FAR_RANGE)
-    {
-        // 距离较近，切换回近距离相机
+    // 当前只使用 6 mm 相机；目标距离和跟踪状态变化时保持使用它。
+    if (current_camera_type_.get() != CameraType::CAMERA_NEAR_RANGE) {
         switchCamera(CameraType::CAMERA_NEAR_RANGE);
     }
 }

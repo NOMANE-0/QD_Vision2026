@@ -1,0 +1,13 @@
+/**:
+  ros__parameters:
+    address: "0.0.0.0"
+    port: 8765
+    tls: false
+    # connectionGraph 供 Foxglove 的 Topic Graph 面板显示节点连接。
+    capabilities: [clientPublish, parameters, parametersSubscribe, services, connectionGraph, assets]
+    topic_whitelist: [".*"]
+    param_whitelist: [".*"]
+    service_whitelist: [".*"]
+    include_hidden: false
+    min_qos_depth: 1
+    max_qos_depth: 10

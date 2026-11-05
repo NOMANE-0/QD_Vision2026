@@ -17,6 +17,9 @@
 // limitations under the License.
 
 #include "armor_solver/armor_solver_node.hpp"
+#include "armor_solver/armor_measurement_gate.hpp"
+
+#include <cmath>
 
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.hpp>
@@ -63,6 +66,13 @@ ArmorSolverNode::ArmorSolverNode(const rclcpp::NodeOptions& options):
     FYT_INFO("armor_solver", "Starting ArmorSolverNode!");
 
     debug_mode_ = this->declare_parameter("debug", true);
+    enable_ekf_ = this->declare_parameter("enable_ekf", true);
+    yaw_command_filter_ = YawCommandFilter(
+        this->declare_parameter("solver.yaw_filter_alpha", 0.25),
+        this->declare_parameter("solver.yaw_filter_deadband_deg", 0.15)
+    );
+    yaw_filter_fire_tolerance_deg_ =
+        this->declare_parameter("solver.yaw_filter_fire_tolerance_deg", 0.5);
 
     // Tracker 初始化参数
     double max_match_distance = this->declare_parameter("tracker.max_match_distance", 0.2);
@@ -139,7 +149,11 @@ ArmorSolverNode::ArmorSolverNode(const rclcpp::NodeOptions& options):
     heartbeat_ = HeartBeatPublisher::create(this);
 
     //平移运动模型ekf
-    init_ArmorStateEKF();
+    if (enable_ekf_) {
+        init_ArmorStateEKF();
+    } else {
+        FYT_INFO("armor_solver", "EKF disabled: publishing PnP poses and images only");
+    }
 
     enable_YawPnP = this->declare_parameter("enable_solveYawPnp", false);
     max_armor_distance_ = this->declare_parameter("max_armor_distance", 10.0);
@@ -170,12 +184,20 @@ ArmorSolverNode::~ArmorSolverNode() {
  */
 void ArmorSolverNode::timerCallback() {
     enable_ = state_machine_.shouldDetect();
-    if (!enable_) {
+    if (!enable_ || !enable_ekf_) {
+        std::lock_guard<std::mutex> lock(solver_state_mutex_);
+        yaw_command_filter_.reset();
+        if (solver_) {
+            solver_->reset_top_level();
+        }
         return;
     }
 
     // Init message
     rm_interfaces::msg::GimbalCmd control_msg;
+    // 无目标指令也使用当前 ROS 时间，保证图表与串口调试消息具有有效时间戳。
+    control_msg.header.stamp = this->now();
+    control_msg.header.frame_id = target_frame_;
     control_msg.yaw_diff = 0;
     control_msg.pitch_diff = 0;
     control_msg.distance = -1;
@@ -191,6 +213,8 @@ void ArmorSolverNode::timerCallback() {
 
     // If target never detected
     if (armor_target_.header.frame_id.empty()) {
+        yaw_command_filter_.reset();
+        solver_->reset_top_level();
         gimbal_pub_->publish(std::make_unique<rm_interfaces::msg::GimbalCmd>(std::move(control_msg))
         );
         return;
@@ -214,9 +238,36 @@ void ArmorSolverNode::timerCallback() {
 
             control_msg.header.stamp = solve_start_time;
 
+            if (std::isfinite(control_msg.yaw) && std::isfinite(control_msg.pitch)
+                && std::isfinite(control_msg.distance) && control_msg.distance > 0.0)
+            {
+                const double raw_yaw_deg = control_msg.yaw;
+                control_msg.yaw = yaw_command_filter_.update(
+                    raw_yaw_deg, rclcpp::Time(armor_target_.header.stamp).nanoseconds(),
+                    armor_target_.id
+                );
+                if (std::abs(std::remainder(raw_yaw_deg - control_msg.yaw, 360.0))
+                    > yaw_filter_fire_tolerance_deg_)
+                {
+                    control_msg.fire_advice = false;
+                }
+            } else {
+                yaw_command_filter_.reset();
+                control_msg.id = "0";
+                control_msg.distance = -1.0;
+                control_msg.fire_advice = false;
+                control_msg.yaw = 0.0;
+                control_msg.pitch = 0.0;
+            }
+
         } catch (...) {
+            yaw_command_filter_.reset();
+            solver_->reset_top_level();
             FYT_ERROR("armor_solver", "Something went wrong in solver!");
         }
+    } else {
+        yaw_command_filter_.reset();
+        solver_->reset_top_level();
     }
 
     publishMarkers(armor_target_, control_msg);
@@ -518,6 +569,10 @@ void ArmorSolverNode::drawArmors(
         }
     }
 
+    // 未滤波的检测框彼此独立，不绘制整车模型的连接线。
+    if (!enable_ekf_) {
+        return;
+    }
     const size_t num = all_armor_pts.size();
     for (size_t i = 0; i < num; ++i) {
         const auto& curr_pts = all_armor_pts[i];
@@ -570,11 +625,6 @@ void ArmorSolverNode::publishResultImage(ResultImageTask result_image_task) {
     result_img_pub_.publish(result_msg);
 }
 
-/**
- * @brief 识别节点消息处理逻辑
- * 
- * @param armors_msg 
- */
 bool ArmorSolverNode::processArmors(
     const rm_interfaces::msg::Armors::SharedPtr& armors_msg,
     const sensor_msgs::msg::CameraInfo& camera_info,
@@ -583,7 +633,7 @@ bool ArmorSolverNode::processArmors(
     std::lock_guard<std::mutex> lock(solver_state_mutex_);
 
     // Lazy initialize solver owing to weak_from_this() can't be called in constructor
-    if (solver_ == nullptr) {
+    if (enable_ekf_ && solver_ == nullptr) {
         solver_ = std::make_unique<Solver>(weak_from_this());
     }
 
@@ -635,12 +685,85 @@ bool ArmorSolverNode::processArmors(
         armors_msg->armors.end()
     );
 
+    // 跟踪期间排除同号地面反光：它的高度远离所有预测板位，会把 EKF 整体拉低。
+    constexpr double kMaximumHeightResidualM = 0.30;
+    const rclcpp::Time time = armors_msg->header.stamp;
+    if (enable_ekf_ && tracker_->tracker_state != TrackerState::LOST && !tracker_->dz_list_.empty()
+        && (time - last_time_).seconds() > 0.0 && (time - last_time_).seconds() <= 0.15)
+    {
+        armors_msg->armors.erase(
+            std::remove_if(
+                armors_msg->armors.begin(),
+                armors_msg->armors.end(),
+                [this, kMaximumHeightResidualM](const rm_interfaces::msg::Armor& armor) {
+                    return armor.number == tracker_->tracked_id
+                        && !is_armor_height_consistent(
+                               armor.pose.position.z,
+                               tracker_->dz_list_,
+                               kMaximumHeightResidualM
+                        );
+                }
+            ),
+            armors_msg->armors.end()
+        );
+    }
+
     // Init message
     rm_interfaces::msg::Measurement measure_msg;
     rm_interfaces::msg::Target target_msg;
-    rclcpp::Time time = armors_msg->header.stamp;
     target_msg.header.stamp = time;
     target_msg.header.frame_id = target_frame_;
+
+    if (!enable_ekf_) {
+        // 按本帧观测独立解算 yaw，不读取 EKF 的预测状态。
+        if (solveYawPnP_) {
+            std::vector<std::string> solved_ids;
+            for (const auto& armor: armors_msg->armors) {
+                if (std::find(solved_ids.begin(), solved_ids.end(), armor.number)
+                    != solved_ids.end())
+                {
+                    continue;
+                }
+                solved_ids.push_back(armor.number);
+                solveYawPnP_->solve(
+                    armors_msg, source_header, M_PI / 4., armor.number, tf2_buffer_
+                );
+            }
+        }
+
+        // 观测量取离画面中心最近的装甲板；位置与朝向均来自本帧 PnP。
+        if (!armors_msg->armors.empty()) {
+            const auto nearest = std::min_element(
+                armors_msg->armors.begin(),
+                armors_msg->armors.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return lhs.distance_to_image_center < rhs.distance_to_image_center;
+                }
+            );
+            const auto& position = nearest->pose.position;
+            measure_msg.x = position.x;
+            measure_msg.y = position.y;
+            measure_msg.z = position.z;
+            const double horizontal_distance = std::hypot(position.x, position.y);
+            measure_msg.center_yaw = std::atan2(position.y, position.x);
+            measure_msg.center_yaw_deg = measure_msg.center_yaw * 180.0 / M_PI;
+            measure_msg.pitch = std::atan2(position.z, horizontal_distance);
+            measure_msg.distance = std::hypot(horizontal_distance, position.z);
+            tf2::Quaternion orientation;
+            tf2::fromMsg(nearest->pose.orientation, orientation);
+            tf2::Matrix3x3(orientation).getRPY(
+                measure_msg.armor_roll, measure_msg.armor_pitch, measure_msg.yaw
+            );
+            measure_pub_->publish(measure_msg);
+        }
+
+        target_msg.tracking = false;
+        armor_target_ = target_msg;
+        target_pub_->publish(target_msg);
+        reprojected_armors = armors_msg->armors;
+        heartbeat_->publish();
+        return true;
+    }
 
     // Update tracker
     if (tracker_->tracker_state == TrackerState::LOST) {
@@ -694,6 +817,11 @@ bool ArmorSolverNode::processArmors(
         // 更新模型
         tracker_->update(armors_msg);
 
+        // 本帧没有有效观测时，不让预测沿用的自转速度累计旋转模式确认次数。
+        if (tracker_->tracker_state == TrackerState::TEMP_LOST) {
+            solver_->reset_top_level();
+        }
+
         // 更新跟踪状态
         if (tracker_->tracker_state == TrackerState::DETECTING) {
             target_msg.tracking = false;
@@ -716,6 +844,7 @@ bool ArmorSolverNode::processArmors(
         measure_msg.y = tracked_pose.position.y;
         measure_msg.z = tracked_pose.position.z;
         measure_msg.center_yaw = tracker_->measurement(0);
+        measure_msg.center_yaw_deg = measure_msg.center_yaw * 180.0 / M_PI;
         measure_msg.pitch = tracker_->measurement(1);
         measure_msg.distance = tracker_->measurement(2);
         measure_msg.yaw = tracker_->measurement(3);
@@ -980,27 +1109,24 @@ void ArmorSolverNode::setModeCallback(
     FYT_WARN("armor_solver", "Set Mode to {}", visionModeToString(mode));
 }
 
-/**
- * @brief 串口节点回调，更新弹速
- * 
- * @param serial_data 
- */
 void ArmorSolverNode::serialCallback(
     const rm_interfaces::msg::SerialReceiveData::ConstSharedPtr serial_data
 ) {
-    double bullet_speed = serial_data->bullet_speed;
+    const double raw_bullet_speed = serial_data->bullet_speed;
+    if (!std::isfinite(raw_bullet_speed) || raw_bullet_speed <= 10.0) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(solver_state_mutex_);
         if (solver_ == nullptr) {
             return;
         }
+        // 每条新反馈仅更新一次，避免解算循环重复滤波同一份数据。
+        solver_->update_bullet_speed(raw_bullet_speed);
     }
 
-    if (bullet_speed <= 10.0) {
-        return;
-    }
-
-    auto result = this->set_parameter(rclcpp::Parameter("solver.bullet_speed", bullet_speed));
+    auto result = this->set_parameter(rclcpp::Parameter("solver.bullet_speed", raw_bullet_speed));
 
     if (!result.successful) {
         RCLCPP_WARN(this->get_logger(), "Failed to set bullet_speed parameter");

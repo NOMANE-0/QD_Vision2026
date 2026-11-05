@@ -1,16 +1,24 @@
 gimbal2camera:
-  xyz: "\"0.0461892 0.0 -0.0603874\""
-  rpy: "\"0.0 0.091 0.0\""
-
+ xyz: "\"0.116153 -0.000372 0.075125\""
+ rpy: "\"-0.052529 -0.118915 0.009291\""
 #第二个头的gimbal2camera
-  xyz_: "\"0 0 0\""
-  rpy_: "\"0 0 0\""
+ xyz_: "\"0 0 0\""
+ rpy_: "\"0 0 0\""
 
 # 设置启动参数
 namespace: ""
+# true: 启动时自动打开装甲板检测效果窗口（需要桌面 DISPLAY 和 X11 授权）
+show_auto_aim_view: false
 # 图像获取方式
 # true: 状态机线程模式(image_callback) false: 话题订阅模式(imageCallback)
 use_state_machine_camera: true
+# 网口相机位于 10.99.99.0/24；实体相机启动前为该网卡添加本机地址
+camera_network:
+  enabled: true
+  interface: enp3s0
+  address: 10.99.99.1/24
+# true: 随自瞄启动 Foxglove Bridge，供远程查看节点、话题和 TF
+enable_foxglove_bridge: false
 # true: 英雄解算 false: 传统解算
 hero_solver: false
 # true: 开启打符 false：关闭打符,会设置 serial_driver 协议为 hero
@@ -20,7 +28,7 @@ navigation: false
 # true: 开启录包记录视频和串口信息 false：关闭录包
 record: false
 # true: 开启rosbag录制 false：关闭
-auto_record: true
+auto_record: false
 # true: 使用视频文件作为图像输入 false：使用物理相机
 video_player: false
 # true: 使用虚拟串口数据 false：使用物理串口

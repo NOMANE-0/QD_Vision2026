@@ -22,6 +22,7 @@
   <exec_depend>tf_transformations</exec_depend>
   <exec_depend>rm_interfaces</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>foxglove_bridge</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -44,7 +44,7 @@ RUN \
 RUN \
     apt update && apt install -y \
     # 一些常用工具
-    nano htop rsync \
+    nano htop rsync iproute2 \
     # ROS
     locales curl lsb-release \
     # 编译工具

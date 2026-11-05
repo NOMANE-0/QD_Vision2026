@@ -1,9 +1,11 @@
 import os
+import subprocess
 import sys
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch.substitutions import Command
-from launch.actions import SetEnvironmentVariable
+from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch import LaunchDescription
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
@@ -11,6 +13,26 @@ from launch_ros.parameter_descriptions import ParameterValue
 from launch.actions import TimerAction
 
 sys.path.append(os.path.join(get_package_share_directory('rm_bringup'), 'launch'))
+
+def ensure_camera_network(network_config):
+    """确保网口相机使用的网卡具有指定的本机地址。"""
+    interface = network_config['interface']
+    address = network_config['address']
+    try:
+        result = subprocess.run(
+            ['ip', '-o', '-4', 'addr', 'show', 'dev', interface],
+            check=True, capture_output=True, text=True)
+        if any(line.split()[3] == address for line in result.stdout.splitlines()):
+            return
+        subprocess.run(
+            ['ip', 'addr', 'add', address, 'dev', interface],
+            check=True, capture_output=True, text=True)
+        print(f'[rm_bringup] Added {address} to {interface} for the GigE camera.')
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+        raise RuntimeError(
+            f'Failed to configure GigE camera network ({interface}, {address}): {detail}'
+        ) from exc
 
 def generate_launch_description():
 
@@ -24,6 +46,13 @@ def generate_launch_description():
         launch_params['video_player'] = False
         launch_params['virtual_serial'] = False
 
+    # 使用实体相机时，在驱动加载前配置网口相机所在的网段。
+    use_physical_camera = not launch_params.get('replay', False) and (
+        launch_params['use_state_machine_camera'] or not launch_params.get('video_player', False))
+    camera_network = launch_params.get('camera_network', {})
+    if use_physical_camera and camera_network.get('enabled', False):
+        ensure_camera_network(camera_network)
+
     if launch_params.get('record', False) and launch_params.get('auto_record', False):
         print('[rm_bringup] record and auto_record cannot both be true; disabling record.')
         launch_params['record'] = False
@@ -33,7 +62,12 @@ def generate_launch_description():
 
     # 定义获取参数文件的辅助函数
     def get_params(name):
-        return os.path.join(get_package_share_directory('rm_bringup'), 'config', 'node_params', '{}_params.yaml'.format(name))
+        path = os.path.join(get_package_share_directory('rm_bringup'), 'config', 'node_params', '{}_params.yaml'.format(name))
+        # 相机配置同时供状态机读取；以字典传入 ROS，展开为 camera_6mm.* 参数。
+        if name == 'camera_driver':
+            with open(path, encoding='utf-8') as config_file:
+                return yaml.safe_load(config_file)
+        return path
 
     # --- 准备 ComposableNode 列表 ---
     composable_nodes = []
@@ -203,8 +237,23 @@ def generate_launch_description():
 
     actions = [
         set_domain_id,
-        container
     ]
+    # 完整 MVS SDK 提供网口相机传输层；优先于仓库中仅含 USB 的 SDK 库。
+    sdk_path = '/opt/MVS/lib/64'
+    if os.path.isdir(sdk_path):
+        actions.append(SetEnvironmentVariable(
+            'LD_LIBRARY_PATH',
+            ':'.join([sdk_path, os.path.join(sdk_path, 'ThirdParty'),
+                      os.environ.get('LD_LIBRARY_PATH', '')])
+        ))
+    actions.append(container)
+    if launch_params.get('enable_foxglove_bridge', False):
+        actions.append(IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(os.path.join(
+                get_package_share_directory('rm_bringup'), 'launch',
+                'foxglove_bridge.launch.py')),
+            launch_arguments={'namespace': node_namespace}.items()
+        ))
     if launch_params.get('enable_dynamic_camera_tf', True):
         # 动态 TF 调参节点（用于调试相机安装的 rpy 误差）
         # 使用 ros2 param set /dynamic_camera_tf pitch 0.02 来调整

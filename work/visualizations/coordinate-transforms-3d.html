@@ -1,0 +1,173 @@
+<div id="qd-coordinates">
+  <style>
+    #qd-coordinates { color: var(--foreground); }
+    #qd-coordinates .chain { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:12px 0; }
+    #qd-coordinates .scene { width:100%; display:block; touch-action:none; cursor:grab; }
+    #qd-coordinates .scene:active { cursor:grabbing; }
+    #qd-coordinates .scene text { fill:var(--foreground); font-size:12px; font-weight:400; paint-order:stroke; stroke:var(--background); stroke-width:4px; stroke-linejoin:round; }
+    #qd-coordinates .sliders { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:18px; margin:12px 0; }
+    #qd-coordinates .slider-head { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px; }
+    #qd-coordinates .legend { display:flex; flex-wrap:wrap; gap:16px; margin:8px 0; }
+    #qd-coordinates .key { display:inline-block; width:18px; height:3px; vertical-align:middle; margin-right:5px; }
+    #qd-coordinates .selected-row { background:var(--accent); color:var(--accent-foreground); }
+    #qd-coordinates td:first-child { overflow-wrap:anywhere; }
+    #qd-coordinates .detail { margin-top:8px; min-height:2em; }
+    @media (max-width:480px) { #qd-coordinates .sliders { grid-template-columns:1fr; gap:8px; } }
+  </style>
+  <h3>自瞄坐标转换 · 三维空间</h3>
+  <div class="chain text-small" aria-label="TF父子关系">
+    <span>odom</span><span>→</span><span>gimbal_link</span><span>→</span><span>camera_link</span><span>→</span><span>camera_optical_frame</span>
+  </div>
+  <div class="viz-controls">
+    <label class="form-label">观察范围
+      <select class="form-select" data-control="view"><option value="scene">整体 · 固定目标</option><option value="mount">安装偏移 · 局部放大</option><option value="top">整体 · 俯视</option></select>
+    </label>
+    <label class="form-label">显示坐标轴
+      <select class="form-select" data-control="frame"><option value="optical">camera_optical_frame · 光学</option><option value="camera">camera_link · 安装</option><option value="gimbal">gimbal_link · 云台</option><option value="odom">odom · 参考</option></select>
+    </label>
+  </div>
+  <div class="sliders">
+    <label class="form-label"><span class="slider-head"><span>电控 yaw</span><output data-value="yaw" class="tabular-nums"></output></span><input class="form-range" data-control="yaw" type="range" min="-60" max="60" step="1" value="20"></label>
+    <label class="form-label"><span class="slider-head"><span>电控 pitch ↑为正</span><output data-value="pitch" class="tabular-nums"></output></span><input class="form-range" data-control="pitch" type="range" min="-30" max="30" step="1" value="10"></label>
+    <label class="form-label"><span class="slider-head"><span>电控 roll</span><output data-value="roll" class="tabular-nums"></output></span><input class="form-range" data-control="roll" type="range" min="-30" max="30" step="1" value="0"></label>
+  </div>
+  <div class="legend text-small"><span><i class="key" style="background:var(--viz-series-1)"></i>X 轴</span><span><i class="key" style="background:var(--viz-series-2)"></i>Y 轴</span><span><i class="key" style="background:var(--viz-series-3)"></i>Z 轴</span><span><i class="key" style="background:var(--viz-series-4)"></i>固定目标 / 视线</span><span>拖动旋转视角</span></div>
+  <svg class="scene" role="img" aria-label="可旋转的三维坐标系：云台原点与odom重合，相机具有真实安装偏移，目标固定在odom的3、0.8、0.6米处。"></svg>
+  <div class="detail text-small" data-detail aria-live="polite"></div>
+  <table class="table table-sm tabular-nums" aria-label="同一目标在各坐标系的位置，单位米">
+    <thead><tr><th scope="col">同一目标 · 坐标系</th><th scope="col" class="text-end">X / m</th><th scope="col" class="text-end">Y / m</th><th scope="col" class="text-end">Z / m</th></tr></thead>
+    <tbody data-coordinates></tbody>
+  </table>
+  <div class="text-small" data-extrinsics></div>
+  <script>
+  (() => {
+    const root = document.getElementById('qd-coordinates');
+    const svg = root.querySelector('.scene');
+    const defaults = {yaw:20,pitch:10,roll:0,view:'scene',frame:'optical',az:-1.0,el:0.48};
+    let state = {...defaults};
+    const names = {odom:'odom',gimbal:'gimbal_link',camera:'camera_link',optical:'camera_optical_frame'};
+    const target = [3,0.8,0.6];
+    const offset = [0.113477,0.000547,0.087106];
+    const install = [-0.017381,-0.077217,0.007199];
+    const identity = [[1,0,0],[0,1,0],[0,0,1]];
+    const opticalRotation = [[0,0,1],[-1,0,0],[0,-1,0]];
+    const add = (a,b) => a.map((x,i)=>x+b[i]);
+    const sub = (a,b) => a.map((x,i)=>x-b[i]);
+    const scale = (a,s) => a.map(x=>x*s);
+    const dot = (a,b) => a.reduce((sum,x,i)=>sum+x*b[i],0);
+    const transpose = a => a[0].map((_,i)=>a.map(row=>row[i]));
+    const mv = (a,v) => a.map(row=>dot(row,v));
+    const mm = (a,b) => a.map(row=>transpose(b).map(col=>dot(row,col)));
+    const rad = x=>x*Math.PI/180;
+    // 与 TF setRPY 一致：Rz(yaw) Ry(pitch) Rx(roll)。
+    function rotation(r,p,y) {
+      const cr=Math.cos(r),sr=Math.sin(r),cp=Math.cos(p),sp=Math.sin(p),cy=Math.cos(y),sy=Math.sin(y);
+      return [[cy*cp,cy*sp*sr-sy*cr,cy*sp*cr+sy*sr],[sy*cp,sy*sp*sr+cy*cr,sy*sp*cr-cy*sr],[-sp,cp*sr,cp*cr]];
+    }
+    function frames() {
+      const g = rotation(rad(state.roll),-rad(state.pitch),rad(state.yaw));
+      const c = mm(g,rotation(...install)), pos=mv(g,offset);
+      return {odom:{r:identity,p:[0,0,0]},gimbal:{r:g,p:[0,0,0]},camera:{r:c,p:pos},optical:{r:mm(c,opticalRotation),p:pos}};
+    }
+    function restore(snapshot) {
+      const incoming = {...snapshot?.modelContent,...snapshot?.privateContent};
+      state = {...defaults};
+      for(const k of ['yaw','pitch','roll','az','el']) if(Number.isFinite(incoming[k])) state[k]=incoming[k];
+      state.yaw=Math.max(-60,Math.min(60,state.yaw));state.pitch=Math.max(-30,Math.min(30,state.pitch));state.roll=Math.max(-30,Math.min(30,state.roll));
+      state.el=Math.max(-1.3,Math.min(1.45,state.el));
+      if(['scene','mount','top'].includes(incoming.view))state.view=incoming.view;
+      if(names[incoming.frame])state.frame=incoming.frame;
+      root.querySelectorAll('[data-control]').forEach(el=>el.value=state[el.dataset.control]);
+    }
+    function save() {
+      if(window.openai?.setWidgetState) window.openai.setWidgetState({modelContent:{yaw:state.yaw,pitch:state.pitch,roll:state.roll,view:state.view,frame:state.frame},privateContent:{az:state.az,el:state.el}}).catch(()=>{});
+    }
+    function draw() {
+      const f=frames(), local=state.view==='mount', top=state.view==='top';
+      const width=Math.max(300,root.clientWidth),height=width<480?340:400;
+      svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
+      svg.style.height=height+'px';
+      const az=state.az,el=top?Math.PI/2:state.el;
+      const right=[-Math.sin(az),Math.cos(az),0],up=[-Math.cos(az)*Math.sin(el),-Math.sin(az)*Math.sin(el),Math.cos(el)];
+      const center=local?scale(f.camera.p,0.5):[1.35,0.35,0.2];
+      const unit=local?Math.min(width/0.65,height/0.48):Math.min(width/5.4,height/4.0);
+      function project(p){const d=sub(p,center);return [width/2+dot(d,right)*unit,height/2-dot(d,up)*unit];}
+      const scene=[],labels=[];
+      function line(a,b,color='var(--border)',w=1,dash=''){
+        const p=project(a),q=project(b);scene.push(`<line x1="${p[0]}" y1="${p[1]}" x2="${q[0]}" y2="${q[1]}" stroke="${color}" stroke-width="${w}" ${dash?`stroke-dasharray="${dash}"`:''}/>`);
+      }
+      function label(p,text,dx=7,dy=-7,priority=1){const xy=project(p);labels.push({x:xy[0]+dx,y:xy[1]+dy,text,priority});}
+      function point(p,r,color){const xy=project(p);scene.push(`<circle cx="${xy[0]}" cy="${xy[1]}" r="${r}" fill="${color}"/>`);}
+      function arrow(a,b,color){line(a,b,color,2.5);const p=project(a),q=project(b),dx=q[0]-p[0],dy=q[1]-p[1],n=Math.hypot(dx,dy);if(n<3)return;const ux=dx/n,uy=dy/n;scene.push(`<path d="M ${q[0]} ${q[1]} L ${q[0]-8*ux+3*uy} ${q[1]-8*uy-3*ux} L ${q[0]-8*ux-3*uy} ${q[1]-8*uy+3*ux} Z" fill="${color}"/>`);}
+      const gridStep=local?0.05:0.5,gridMin=local?-0.2:-1,gridMax=local?0.3:4;
+      for(let n=gridMin;n<=gridMax+0.0001;n+=gridStep){line([n,gridMin,0],[n,gridMax,0]);line([gridMin,n,0],[gridMax,n,0]);}
+      const ground=local?'参考平面 z = 0 · 网格 5 cm':'参考平面 z = 0 · 网格 0.5 m';
+      scene.push(`<text x="10" y="${height-12}">${ground}</text>`);
+      // 线框仅标示云台与相机朝向，不代表机械尺寸。
+      const gp=p=>mv(f.gimbal.r,p),cp=p=>add(f.camera.p,mv(f.camera.r,p));
+      const ring=Array.from({length:33},(_,i)=>gp([0.045*Math.cos(i*Math.PI/16),0.045*Math.sin(i*Math.PI/16),0]));
+      ring.slice(1).forEach((p,i)=>line(ring[i],p,'var(--muted-foreground)',1.5));
+      line([0,0,0],gp([local?0.18:0.5,0,0]),'var(--muted-foreground)',2);
+      const box=[[-.025,-.025,-.02],[.025,-.025,-.02],[.025,.025,-.02],[-.025,.025,-.02],[-.025,-.025,.02],[.025,-.025,.02],[.025,.025,.02],[-.025,.025,.02]].map(cp);
+      [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]].forEach(([i,j])=>line(box[i],box[j],'var(--muted-foreground)',1.5));
+      line([0,0,0],f.camera.p,'var(--foreground)',2,'4 3');
+      point([0,0,0],4,'var(--foreground)');point(f.camera.p,4,'var(--foreground)');
+      const length=local?.105:.58,selected=f[state.frame];
+      if(state.frame!=='odom'){
+        for(let i=0;i<3;i++){const end=identity[i].map(v=>v*(local?.15:.8));line([0,0,0],end,'var(--muted-foreground)',1,'3 3');label(end,['Xₒ','Yₒ','Zₒ'][i],5,-5,0);}
+      }
+      const directions=state.frame==='optical'?['X 右','Y 下','Z 前']:['X 前','Y 左','Z 上'];
+      for(let i=0;i<3;i++){
+        const axis=mv(selected.r,identity[i]),end=add(selected.p,scale(axis,length));
+        arrow(selected.p,end,`var(--viz-series-${i+1})`);label(end,state.frame==='odom'?['Xₒ','Yₒ','Zₒ'][i]:directions[i],8,-7,2);
+      }
+      label([0,0,0],local?'odom / 云台原点':'odom / gimbal 原点',-10,25,2);
+      if(local){
+        label(f.camera.p,'相机原点',12,18,2);
+        const end=add(f.camera.p,scale(mv(f.optical.r,[0,0,1]),.21));line(f.camera.p,end,'var(--viz-series-4)',1.5,'5 4');label(end,'光轴',5,-5,1);
+      } else {
+        line(f.camera.p,target,'var(--viz-series-4)',2);
+        const end=add(f.camera.p,scale(mv(f.optical.r,[0,0,1]),1.25));line(f.camera.p,end,'var(--muted-foreground)',1,'5 4');label(end,'光轴',8,15,1);
+        line(target,[target[0],target[1],0],'var(--muted-foreground)',1,'3 3');
+        const armor=[add(target,[0,-.10,-.06]),add(target,[0,.10,-.06]),add(target,[0,.10,.06]),add(target,[0,-.10,.06])];
+        scene.push(`<polygon points="${armor.map(p=>project(p).join(',')).join(' ')}" fill="var(--viz-series-4)" fill-opacity="0.25" stroke="var(--viz-series-4)"/>`);
+        point(target,5,'var(--viz-series-4)');label(target,'目标 P · odom 固定',8,-18,3);
+      }
+      // 标签按重要程度避让，窄屏保留目标、原点和当前坐标轴。
+      const occupied=[];
+      labels.sort((a,b)=>b.priority-a.priority).forEach(l=>{
+        const textWidth=[...l.text].reduce((n,c)=>n+(c.charCodeAt(0)>255?12:7),0);
+        const x=Math.max(8,Math.min(width-textWidth-8,l.x));
+        let chosen=null;
+        for(const dy of [0,-18,18,-36,36,-54,54]){
+          const y=Math.max(18,Math.min(height-38,l.y+dy));const rect={x,y:y-12,w:textWidth,h:16};
+          if(!occupied.some(b=>rect.x<b.x+b.w+5&&rect.x+rect.w+5>b.x&&rect.y<b.y+b.h+3&&rect.y+rect.h+3>b.y)){chosen={...rect,baseline:y};break;}
+        }
+        if(chosen){occupied.push(chosen);scene.push(`<text x="${chosen.x}" y="${chosen.baseline}">${l.text}</text>`);}
+      });
+      svg.innerHTML='<title>主相机坐标变换三维示意</title><desc>云台姿态来自演示滑块，安装参数来自当前项目配置，目标位置为教学示例。坐标轴长度和相机线框为示意。</desc>'+scene.join('');
+      for(const k of ['yaw','pitch','roll'])root.querySelector(`[data-value="${k}"]`).textContent=state[k].toFixed(0)+'°';
+      root.querySelector('[data-coordinates]').innerHTML=['optical','camera','gimbal','odom'].map(k=>{
+        const p=mv(transpose(f[k].r),sub(target,f[k].p));
+        return `<tr ${state.frame===k?'class="selected-row"':''}><td>${names[k]}</td>${p.map(v=>`<td class="text-end">${(Math.abs(v)<.0005?0:v).toFixed(3)}</td>`).join('')}</tr>`;
+      }).join('');
+      const opticalPoint=mv(transpose(f.optical.r),sub(target,f.optical.p));
+      root.querySelector('[data-detail]').textContent=local?'相机相对云台：前 11.3477 cm · 左 0.0547 cm · 上 8.7106 cm':`演示目标 odom = (3.000, 0.800, 0.600) m · TF pitch = ${(-state.pitch).toFixed(0)}°${opticalPoint[2]<=0?' · 目标位于相机后方':''}`;
+      root.querySelector('[data-extrinsics]').textContent='固定安装 rpy = (−0.017381, −0.077217, 0.007199) rad · 主相机 · 机械外形示意';
+    }
+    restore(window.openai?.widgetState);
+    root.querySelectorAll('[data-control]').forEach(el=>{
+      el.addEventListener('input',()=>{const k=el.dataset.control;state[k]=el.type==='range'?Number(el.value):el.value;draw();});
+      el.addEventListener('change',save);
+    });
+    let drag=null;
+    svg.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY,az:state.az,el:state.el};svg.setPointerCapture(e.pointerId);});
+    svg.addEventListener('pointermove',e=>{if(!drag)return;state.az=drag.az-(e.clientX-drag.x)*.009;state.el=Math.max(-1.3,Math.min(1.45,drag.el+(e.clientY-drag.y)*.007));draw();});
+    svg.addEventListener('pointerup',()=>{if(drag)save();drag=null;});
+    svg.addEventListener('pointercancel',()=>{drag=null;});
+    window.addEventListener('openai:set_globals',e=>{if(e.detail?.globals?.widgetState){restore(e.detail.globals.widgetState);draw();}});
+    new ResizeObserver(draw).observe(root);
+    draw();
+  })();
+  </script>
+</div>

@@ -48,7 +48,9 @@ if(BUILD_TESTING)
   )
   ament_lint_auto_find_test_dependencies()
 
-  find_package(ament_cmake_gtest)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_yaw_stability test/test_yaw_stability.cpp)
+  target_link_libraries(test_yaw_stability ${PROJECT_NAME})
 
 endif()
 

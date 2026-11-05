@@ -50,6 +50,14 @@ public:
     // Receive data from serial port
     virtual bool receive(rm_interfaces::msg::SerialReceiveData& data) = 0;
 
+    /**
+     * @brief 获取最近一次成功接收的 QD yaw 数据年龄编码。
+     * @return 第 14 字节编码；不支持该扩展的协议返回 0，保持旧协议行为。
+     */
+    virtual uint8_t get_yaw_timing_byte() const {
+        return 0;
+    }
+
     // Create subscriptions for SerialDriverNode
     virtual std::vector<rclcpp::SubscriptionBase::SharedPtr>
     getSubscriptions(rclcpp::Node::SharedPtr node) = 0;

@@ -1,6 +1,9 @@
 /**:
   ros__parameters:
-    debug: false
+    debug: true  # 绘制检测框（EKF 关闭）或跟踪投影框（EKF 开启）
+    enable_ekf: true  # 开启 EKF 跟踪预测与云台指令；false 时仅查看图像/PnP，修改后重启
+    # 结果图是彩色图，仅发布原图与普通压缩图，停用深度图压缩插件。
+    armor_solver.result_img.enable_pub_plugins: ["image_transport/raw", "image_transport/compressed"]
     armor_solver.result_img.jpeg_quality: 50  # 结果图像的jpeg压缩质量，0-100，数值越大质量越好，文件也越大
     target_frame: odom
     gimble_frame: gimbal_link
@@ -15,7 +18,7 @@
 
       armor_model:
         q_x: 0.01
-        q_v: 100.0
+        q_v: 1.0  # 降低静止装甲板观测抖动引出的虚假横向速度；实测回放验证
 
         r_yaw: 1.0
         r_pitch: 1.5
@@ -29,13 +32,18 @@
       lost_time_thres: 0.3
           
     solver:
-      use_armor_top: false            # 是否使用平移运动模型(armor_model),仅在 top0 时使用
+      top_activation_frames: 4        # 连续 4 张新图像同向超过阈值才切换旋转瞄准模式
+      yaw_filter_alpha: 0.25          # 每张新图像更新 25%；目标首次出现时直接使用原始角度
+      yaw_filter_deadband_deg: 0.15   # 原始 yaw 与滤波值相差不超过此角度时保持指令
+      yaw_filter_fire_tolerance_deg: 0.5 # 滤波尚未追上原始角度时暂停开火
+      use_armor_top: true             # 普通跟随使用装甲板位置 EKF；陀螺仍使用整车模型
+      enable_motion_prediction: true  # false：保留 EKF 和弹道补偿，跳过所有运动外推；支持在线切换
       predict2send_delay: 0.0         # 从预测到串口发送的延迟
       controller_delay: 0.0           # 开火延迟
       additional_prediction_time: 0.0 # 根据角速度，给电控指令的额外预测时间
       shooting_range_width: 0.135     # 开火宽度范围
       shooting_range_height: 0.135    # 开火高度范围
-      bullet_speed: 23.0   #弹速
+      bullet_speed: 16.0   # 未收到有效电控反馈时的兜底弹速，单位 m/s
       bullet_speed_filter_alpha: 0.3  # 弹速一阶低通滤波系数，越小越稳
       compensator_type: "ceres" # ideal(仅重力) resistance(阻力近似) ceres(ceres线阻力) rk4(四阶龙格库塔)
       gravity: 9.8       #重力加速度
@@ -65,6 +73,6 @@
       # ["距离下限, 距离上限, 高度下限, 高度上限, pitch轴补偿值，yaw轴补偿值"]
       # 目标相对于odom
       angle_offset: [
-        "0.0 6.0 -1.0 1.0 0.0 0.0",
+        "0.0 6.0 -1.0 1.0 1.5 0.0",
 
       ]

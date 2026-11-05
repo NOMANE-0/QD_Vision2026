@@ -16,11 +16,6 @@
 #include "rm_serial_driver/protocol/infantry_protocol.hpp"
 #include <cstddef>
 #include <cstdint>
-#include <ios>
-#include <iostream>
-#include <rclcpp/clock.hpp>
-#include <rclcpp/time.hpp>
-#include <rm_utils/logger/log.hpp>
 
 namespace qd::serial_driver::protocol {
 ProtocolInfantry::ProtocolInfantry(std::string_view port_name, int speed, bool enable_data_print) {
@@ -43,16 +38,6 @@ void ProtocolInfantry::send(const rm_interfaces::msg::GimbalCmd& data) {
     packet.loadData<SendPacket>(pkt, 0);
 
     packet_tool_->sendPacket(packet);
-
-    // 不在 tracking 就不打印延迟了
-    if (data.distance < 0) {
-        return;
-    }
-    FYT_DEBUG(
-        "serial_driver",
-        "Latency(predict to send): {:.2f} ms",
-        (rclcpp::Clock(RCL_ROS_TIME).now() - data.header.stamp).seconds() * 1e3
-    );
 }
 
 bool ProtocolInfantry::receive(rm_interfaces::msg::SerialReceiveData& data) {

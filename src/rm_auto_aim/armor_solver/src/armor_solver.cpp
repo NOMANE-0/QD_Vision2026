@@ -30,15 +30,17 @@ Solver::Solver(std::weak_ptr<rclcpp::Node> n): node_(n) {
     controller_delay_ = node->declare_parameter("solver.controller_delay", 0.0);
     additional_prediction_time = node->declare_parameter("solver.additional_prediction_time", 0.0);
     // 弹速
-    bullet_speed = node->declare_parameter("solver.bullet_speed", 20.0); // 重力
+    bullet_speed = node->declare_parameter("solver.bullet_speed", 16.0);
     bullet_speed_filter_alpha_ =
         std::clamp(node->declare_parameter("solver.bullet_speed_filter_alpha", 0.2), 0.0, 1.0);
-    bullet_speed_filter_initialized_ = bullet_speed > 0.0;
+    // 配置弹速仅用于兜底，首次有效反馈直接初始化滤波状态。
+    bullet_speed_filter_initialized_ = false;
     gravity = node->declare_parameter("solver.gravity", 9.8);
     // 空气阻力
     resistance = node->declare_parameter("solver.resistance", 0.001);
 
     use_armor_top_ = node->declare_parameter("solver.use_armor_top", false);
+    enable_motion_prediction_ = node->declare_parameter("solver.enable_motion_prediction", true);
 
     // 补偿器
     std::string compenstator_type = node->declare_parameter("solver.compensator_type", "ideal");
@@ -66,6 +68,9 @@ Solver::Solver(std::weak_ptr<rclcpp::Node> n): node_(n) {
     activate_threshold[0] = 0.0;
     activate_threshold[1] = node->declare_parameter("solver.top1.activate_threshold", 90.0);
     activate_threshold[2] = node->declare_parameter("solver.top2.activate_threshold", 500.0);
+    top_activation_frames_ = static_cast<int>(std::clamp<std::int64_t>(
+        node->declare_parameter("solver.top_activation_frames", 4), 1, 16
+    ));
     for (auto& angle: activate_threshold)
         angle = angle * M_PI / 180.; // 转弧度制
     deactivate_threshold[0] = 0.0;
@@ -108,17 +113,15 @@ rm_interfaces::msg::GimbalCmd Solver::solve(
         controller_delay_ = node->get_parameter("solver.controller_delay").as_double();
         additional_prediction_time =
             node->get_parameter("solver.additional_prediction_time").as_double();
-        const double raw_bullet_speed = node->get_parameter("solver.bullet_speed").as_double();
         bullet_speed_filter_alpha_ = std::clamp(
             node->get_parameter("solver.bullet_speed_filter_alpha").as_double(),
             0.0,
             1.0
         );
         use_armor_top_ = node->get_parameter("solver.use_armor_top").as_bool();
+        enable_motion_prediction_ = node->get_parameter("solver.enable_motion_prediction").as_bool();
         gimble_frame_ = node->get_parameter("gimble_frame").as_string();
         node.reset();
-
-        update_bullet_speed(raw_bullet_speed);
 
         prediction_delay_ = (current_time - target.header.stamp).seconds();
     } catch (const std::runtime_error& e) {
@@ -142,7 +145,11 @@ rm_interfaces::msg::GimbalCmd Solver::solve(
     }
 
     // 更新旋转状态
-    update_top_level(target.v_yaw);
+    update_top_level(
+        target.v_yaw,
+        rclcpp::Time(target.header.stamp).nanoseconds(),
+        target.id
+    );
     target.top_level = get_top_level();
 
     if (target.id == "outpost") {
@@ -168,10 +175,13 @@ rm_interfaces::msg::GimbalCmd Solver::solve(
     gimbal_cmd.id = target.id;
     auto send_ypd = target_aim.aim_ypd;
     auto send_ypd_v = target_aim.aim_ypd_v;
+    // 关闭运动预测时也跳过额外角速度外推，保留速度输出供对照诊断。
+    const double extra_prediction_time =
+        enable_motion_prediction_ ? additional_prediction_time : 0.0;
     gimbal_cmd.yaw =
-        reduced_angle(send_ypd.yaw + (send_ypd_v.yaw * additional_prediction_time)) * 180 / M_PI;
+        reduced_angle(send_ypd.yaw + (send_ypd_v.yaw * extra_prediction_time)) * 180 / M_PI;
     gimbal_cmd.pitch =
-        (send_ypd.pitch + (send_ypd_v.pitch * additional_prediction_time)) * 180 / M_PI;
+        (send_ypd.pitch + (send_ypd_v.pitch * extra_prediction_time)) * 180 / M_PI;
     gimbal_cmd.yaw_diff = reduced_angle(send_ypd.yaw - gimbal_rpy_[2]) * 180 / M_PI;
     gimbal_cmd.pitch_diff = reduced_angle(send_ypd.pitch - gimbal_rpy_[1]) * 180 / M_PI;
     gimbal_cmd.distance = send_ypd.distance;
@@ -204,11 +214,37 @@ std::vector<std::pair<double, double>> Solver::getTrajectory() const noexcept {
     return trajectory;
 }
 
-/**
-  @brief 更新目标旋转状态
-  @param angular_velocity [IN] 角速度
-*/
-void Solver::update_top_level(const double angular_velocity) {
+void Solver::reset_top_level() noexcept {
+    top_level = 0;
+    top_activation_count_ = 0;
+    top_candidate_sign_ = 0;
+    last_top_frame_stamp_ns_ = 0;
+    top_target_id_.clear();
+}
+
+void Solver::update_top_level(
+    double angular_velocity,
+    std::int64_t frame_stamp_ns,
+    const std::string& target_id
+) {
+    constexpr std::int64_t kMaximumFrameGapNs = 150000000;
+    if (target_id != top_target_id_
+        || (last_top_frame_stamp_ns_ > 0
+            && frame_stamp_ns - last_top_frame_stamp_ns_ > kMaximumFrameGapNs))
+    {
+        reset_top_level();
+    }
+    if (last_top_frame_stamp_ns_ > 0 && frame_stamp_ns <= last_top_frame_stamp_ns_) {
+        return;
+    }
+    last_top_frame_stamp_ns_ = frame_stamp_ns;
+    top_target_id_ = target_id;
+
+    if (!std::isfinite(angular_velocity)) {
+        reset_top_level();
+        return;
+    }
+
     const double credible_abs_w = std::abs(angular_velocity);
     // 最大 top 等级是 2 写死了
     // 是这样的
@@ -218,12 +254,27 @@ void Solver::update_top_level(const double angular_velocity) {
     const double next_level_activate_w =
         this->top_level == 2 ? DBL_MAX : activate_threshold[this->top_level + 1];
     const double deactivate_w =
-        this->top_level == 0 ? DBL_MIN : deactivate_threshold[this->top_level];
+        this->top_level == 0 ? 0.0 : deactivate_threshold[this->top_level];
 
-    if (credible_abs_w >= next_level_activate_w) {
-        this->top_level += 1;
-    } else if (credible_abs_w < deactivate_w) {
+    // 低于退出阈值时降级；进入高等级须由连续新图像确认。
+    if (this->top_level > 0 && credible_abs_w < deactivate_w) {
         this->top_level -= 1;
+        top_activation_count_ = 0;
+        top_candidate_sign_ = 0;
+        return;
+    }
+
+    if (this->top_level < 2 && credible_abs_w >= next_level_activate_w) {
+        const int sign = angular_velocity > 0.0 ? 1 : -1;
+        top_activation_count_ = sign == top_candidate_sign_ ? top_activation_count_ + 1 : 1;
+        top_candidate_sign_ = sign;
+        if (top_activation_count_ >= top_activation_frames_) {
+            this->top_level += 1;
+            top_activation_count_ = 0;
+        }
+    } else {
+        top_activation_count_ = 0;
+        top_candidate_sign_ = 0;
     }
 }
 
@@ -267,6 +318,10 @@ double Solver::get_ballistic_flying_time(const Eigen::Vector3d& target_pos) {
   @return 命中时刻的装甲板状态
 */
 State Solver::solve_impact_state(const State& state, double base_delay) {
+    if (!enable_motion_prediction_) {
+        return state;
+    }
+
     constexpr int kMaxIterations = 8;
     constexpr double kTimeTolerance = 1e-3;
     constexpr double kRelaxation = 0.5;
@@ -402,6 +457,8 @@ ShootState Solver::get_aim_positon(const RosTarget& target_msg, const Eigen::Vec
     );
 
     auto target_aim = YpdCoord_to_ShootState(aim_ypd, isFire);
+    // 普通跟随的状态也须明确赋值，避免串口读取未初始化的目标自转速度。
+    target_aim.state = pre_state;
     target_aim.aim_ypd = aim_ypd;
     target_aim.aim_ypd_v = get_gimbal_ypd_v(p, p_v, gimbal_rpy);
 
@@ -429,20 +486,16 @@ ShootParam Solver::target_pos_to_shoot_param(const Eigen::Vector3d& target_pos) 
     return ShootParam { bs, shoot_angle, aim_xyz_i_barrel, target_pos };
 }
 
-/**
-  @brief 更新滤波后的弹速
-*/
 void Solver::update_bullet_speed(double raw_bullet_speed) {
-    if (raw_bullet_speed <= 0.0) {
+    if (!std::isfinite(raw_bullet_speed) || raw_bullet_speed <= 0.0) {
         return;
     }
 
     if (!bullet_speed_filter_initialized_) {
         bullet_speed = raw_bullet_speed;
         bullet_speed_filter_initialized_ = true;
-    } else if (bullet_speed_receive != raw_bullet_speed) {
+    } else {
         bullet_speed += bullet_speed_filter_alpha_ * (raw_bullet_speed - bullet_speed);
-        bullet_speed_receive = raw_bullet_speed;
     }
 
     if (trajectory_compensator_) {
@@ -461,6 +514,10 @@ double Solver::get_bullet_speed() {
   @brief 预测装甲板dt后的向量
 */
 State Solver::state_predict(const State& state, double dt) {
+    if (!enable_motion_prediction_) {
+        return state;
+    }
+
     State state_predict = state;
     state_predict(0) += state_predict(1) * dt;
     state_predict(2) += state_predict(3) * dt;

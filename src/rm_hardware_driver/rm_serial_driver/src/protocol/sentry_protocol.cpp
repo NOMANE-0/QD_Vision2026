@@ -38,16 +38,6 @@ void ProtocolSentry::send(const rm_interfaces::msg::GimbalCmd &data) {
     packet.loadData<SendPacket>(pkt, 0);
 
     packet_tool_->sendPacket(packet);
-
-    // 不在 tracking 就不打印延迟了
-    if (data.distance < 0) {
-        return;
-    }
-    FYT_DEBUG(
-        "serial_driver",
-        "Latency(predict to send): {:.2f} ms",
-        (rclcpp::Clock(RCL_ROS_TIME).now() - data.header.stamp).seconds() * 1e3
-    );
 }
 
 void ProtocolSentry::send(const rm_interfaces::msg::ChassisCmd &data) {

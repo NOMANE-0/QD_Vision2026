@@ -48,6 +48,7 @@
 #include "armor_solver/armor_tracker.hpp"
 // #include "armor_solver/solveYawPnP.hpp"
 #include "armor_solver/armor_yaw_solver.hpp"
+#include "armor_solver/yaw_command_filter.hpp"
 #include "rm_interfaces/msg/armors.hpp"
 #include "rm_interfaces/msg/measurement.hpp"
 #include "rm_interfaces/msg/serial_receive_data.hpp"
@@ -71,11 +72,24 @@ private:
     };
 
     void armorFrameWorkerLoop();
+    /**
+     * @brief 处理本帧 PnP 观测，并按配置更新 EKF 或发布未滤波观测。
+     * @param armors_ptr 输入相机坐标系位姿，输出 target_frame 坐标系位姿。
+     * @param camera_info 本帧相机内参，供装甲板 yaw 解算使用。
+     * @param reprojected_armors 输出绘图数据，关闭 EKF 时使用原始检测角点。
+     * @return 坐标变换和本帧处理成功时返回 true。
+     * @note enable_ekf 在启动时读取；关闭时不生成跟踪预测或云台指令。
+     */
     bool processArmors(
         const rm_interfaces::msg::Armors::SharedPtr& armors_ptr,
         const sensor_msgs::msg::CameraInfo& camera_info,
         std::vector<rm_interfaces::msg::Armor>& reprojected_armors
     );
+    /**
+     * @brief 根据新的有效串口反馈更新解算弹速并记录原始弹速参数。
+     * @param serial_data 电控反馈；弹速单位米每秒，仅接受有限且大于 10 的值。
+     * @note 持有解算状态互斥锁时更新滤波，参数写入在锁外进行。
+     */
     void serialCallback(const rm_interfaces::msg::SerialReceiveData::ConstSharedPtr serial_data);
     void publishArmors(rm_interfaces::msg::Armors&& armors_msg);
     std::vector<rm_interfaces::msg::Armor> getReprojectedArmors();
@@ -102,6 +116,8 @@ private:
     );
 
     bool debug_mode_;
+    // 启动时读取；关闭后仅发布未滤波的装甲板位姿和结果图。
+    bool enable_ekf_;
 
     // Heartbeat
     HeartBeatPublisher::SharedPtr heartbeat_;
@@ -122,6 +138,8 @@ private:
 
     // Armor Solver
     std::unique_ptr<Solver> solver_;
+    YawCommandFilter yaw_command_filter_;
+    double yaw_filter_fire_tolerance_deg_ { 0.5 };
 
     // Armor Yaw Solver
     std::unique_ptr<SolveYawPnP> solveYawPnP_;

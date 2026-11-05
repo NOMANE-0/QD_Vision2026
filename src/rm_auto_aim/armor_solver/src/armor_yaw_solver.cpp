@@ -17,7 +17,7 @@ void SolveYawPnP::solve(
     }
     utils::AutoTimer time1("armor_solver", "solve armor yaw");
 
-    // 获得云台当前姿态
+    // 云台姿态与相机变换必须对应同一图像时刻，避免转动时混入新姿态。
     try {
         auto node = node_.lock();
         auto odom_frame_ = node->get_parameter("target_frame").as_string();
@@ -26,8 +26,12 @@ void SolveYawPnP::solve(
         {
             //获得电控的yaw和设置odom_frame名
             Eigen::Vector3d gimbal_rpy;
-            auto gimbal_tf =
-                tf2_buffer->lookupTransform(odom_frame_, gimble_frame_, tf2::TimePointZero);
+            auto gimbal_tf = tf2_buffer->lookupTransform(
+                odom_frame_,
+                gimble_frame_,
+                source_header.stamp,
+                rclcpp::Duration::from_seconds(0.01)
+            );
             auto msg_q = gimbal_tf.transform.rotation;
 
             tf2::Quaternion tf_q;

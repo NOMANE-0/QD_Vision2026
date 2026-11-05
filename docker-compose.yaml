@@ -1,5 +1,5 @@
 # docker compose up -d 运行构建容器
-# 使用 X11 转发时需主机需要先 xhost +local:root
+# 使用 X11 转发前，在宿主机桌面终端执行 xhost +si:localuser:root
 services:
   rv_devel:  # 服务名，可以随便起
     build:
@@ -16,19 +16,20 @@ services:
     stdin_open: true           # -i
     tty: true                  # -t
 
-    # environment:
+    environment:
       # 将宿主机的 DISPLAY 变量传给容器 (通常是 :0 或 :1)
-      # - DISPLAY=${DISPLAY}
+      - DISPLAY=${DISPLAY:?请在宿主机桌面终端设置 DISPLAY 后启动容器}
       # ⚠️ 针对 Qt 应用 (ROS2 Rviz/Rqt) 的重要补丁，防止界面黑屏或崩溃
-      # - QT_X11_NO_MITSHM=1
+      - QT_X11_NO_MITSHM=1
     # 挂载 (-v)
     volumes:
       # 核心：挂载 X11 Unix Socket 以实现 GUI 转发
-      # - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
       - /dev:/dev # 直接挂载整个 /dev 目录，确保容器内能访问所有设备（如摄像头、串口等）
+      - /opt/MVS:/opt/MVS:ro
       # 注意：在 Compose 中最好用 ${HOME} 替代 ~，它会自动获取你当前用户的家目录
       - ${HOME}/.ros:/root/.ros # 保存日志到宿主机
-      - ${HOME}/rmvision2025:/ros_ws  # 自瞄代码
+      - ./:/ros_ws  # 自瞄代码：挂载当前仓库目录
       - ${HOME}/.vscode-server/:/root/.vscode-server # 防止每次重建容器后 vscode 插件、服务器丢失
 
     # 启动命令 (对应最后那一串)

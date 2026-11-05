@@ -12,38 +12,45 @@ public:
         reset();
     }
 
+    /**
+     * @brief 清除 MCU 计数及 PC 时间映射状态。
+     */
     void reset() {
         is_initialized_ = false;
         skew_ = 1.0;
         last_mcu_time_ = 0.0;
         last_pc_time_ = 0.0;
         last_sync_time_ = 0.0;
+        expected_pc_time_ = 0.0;
         
         last_raw_mcu_time_ = 0;
         raw_mcu_time_accumulator_ = 0;
     }
 
     /**
-     * @brief 动态偏斜时间同步 (Software PLL / 凸包算法)
-     * * @param raw_mcu_timestamp 单片机发来的原始 32 位时间戳
+     * @brief 根据按序 MCU 计数和 PC 接收时间估计共同时间基准。
+     * @param raw_mcu_timestamp 单片机发来的原始 32 位时间戳
      * @param current_pc_time_sec 串口刚收到该数据时 PC 系统的绝对时间 (秒)
      * @param is_timestamp_us MCU 时间戳的单位 (true=微秒, false=毫秒)
-     * @return 剔除 USB 抖动并补偿时钟漂移后的绝对平滑 PC 时间 (秒)
+     * @return 估计的 PC 时钟时间，单位秒；不包含姿态年龄校正。
+     * @note 串口帧按发送顺序输入；计数后退视为 MCU 重启并重建锚点，正常回绕保持连续。
      */
     double sync(uint32_t raw_mcu_timestamp, double current_pc_time_sec, bool is_timestamp_us = false) {
-        // 1. 利用 uint32_t 自动类型回环原理（无符号减法）进行绝对安全的时钟解包，并容忍微小乱序
+        // 1. 用无符号差处理计数回绕，并检测重复时间戳及 MCU 重启。
         if (!is_initialized_) {
             raw_mcu_time_accumulator_ = raw_mcu_timestamp;
             last_raw_mcu_time_ = raw_mcu_timestamp;
         } else {
             int32_t diff = static_cast<int32_t>(raw_mcu_timestamp - last_raw_mcu_time_);
-            // 判断是否是一个新的更大的时间或处理了正常溢出；丢弃过旧的严重乱序包
-            if (diff > 0 || diff < -10000) { 
-                raw_mcu_time_accumulator_ += diff;
-                last_raw_mcu_time_ = raw_mcu_timestamp;
-            } else {
-                // 如果是轻微的时间乱序跳变（如相同时间戳或几毫秒内的旧包），不累加时间累主计数器
+            if (diff == 0) {
+                return expected_pc_time_;
             }
+            if (diff < 0) {
+                reset();
+                return sync(raw_mcu_timestamp, current_pc_time_sec, is_timestamp_us);
+            }
+            raw_mcu_time_accumulator_ += static_cast<uint32_t>(diff);
+            last_raw_mcu_time_ = raw_mcu_timestamp;
         }
 
         // 2. 将离散的 MCU 时间重构为连续递增的绝对时间 (秒)
@@ -55,6 +62,7 @@ public:
             last_mcu_time_ = current_mcu_time;
             last_pc_time_ = current_pc_time_sec;
             last_sync_time_ = current_pc_time_sec;
+            expected_pc_time_ = current_pc_time_sec;
             is_initialized_ = true;
             return current_pc_time_sec;
         }

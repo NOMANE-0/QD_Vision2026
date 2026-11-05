@@ -74,6 +74,12 @@ public:
 private:
     void imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr img_msg);
     void image_callback();
+    /**
+     * @brief 检测图像并发布装甲板结果，跳过启动后的前几帧有效装甲板结果。
+     * @param img 当前相机图像。
+     * @param header 当前帧时间戳和坐标系。
+     * @param camera_info 当前帧的相机内参。
+     */
     void processImageAndPublish(
         cv::Mat img,
         const std_msgs::msg::Header& header,
@@ -147,6 +153,8 @@ private:
     // true: 使用 image_callback (状态机线程模式)
     // false: 使用 imageCallback (话题订阅模式)
     bool use_state_machine_camera_;
+    // 启动后跳过指定数量的有效装甲板结果；空帧不消耗次数。
+    std::atomic<int> startup_detections_remaining_ { 0 };
 
     // Debug information
     bool debug_;

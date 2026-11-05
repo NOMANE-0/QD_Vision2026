@@ -56,16 +56,6 @@ void DefaultProtocol::send(const rm_interfaces::msg::GimbalCmd& data) {
     packet.loadData<SendPacket>(pkt, 0);
 
     packet_tool_->sendPacket(packet);
-
-    // 不在 tracking 就不打印延迟了
-    if (data.distance < 0) {
-        return;
-    }
-    FYT_DEBUG(
-        "serial_driver",
-        "Latency(predict to send): {:.2f} ms",
-        (rclcpp::Clock(RCL_ROS_TIME).now() - data.header.stamp).seconds() * 1e3
-    );
 }
 
 bool DefaultProtocol::receive(rm_interfaces::msg::SerialReceiveData& data) {
@@ -78,13 +68,16 @@ bool DefaultProtocol::receive(rm_interfaces::msg::SerialReceiveData& data) {
     ReceivePacket pkt;
     std::memcpy(&pkt, raw_ptr, sizeof(ReceivePacket));
 
-    // 解包并处理大小端转换
+    // 电控反馈使用小端 int16（度×100）和 uint32（毫秒）。
+    // 当前支持的 amd64/arm64 均为小端；pitch 保持电控抬头为正的符号约定。
     data.mode = pkt.mode;
-    data.roll = swap_bytes(pkt.roll) / 100.0f;
-    data.pitch = -swap_bytes(pkt.pitch) / 100.0f;
-    data.yaw = swap_bytes(pkt.yaw) / 100.0f;
-    data.bullet_speed = swap_bytes(pkt.bullet_speed) / 100.0f;
-    data.mcu_timestamp = swap_bytes(pkt.mcu_timestamp);
+    data.roll = pkt.roll / 100.0f;
+    data.pitch = pkt.pitch / 100.0f;
+    data.yaw = pkt.yaw / 100.0f;
+    data.bullet_speed = pkt.bullet_speed / 100.0f;
+    data.mcu_timestamp = pkt.mcu_timestamp;
+    // QD 帧尚未启用校验，第 14 字节由新电控携带顶板 yaw 数据年龄。
+    yaw_timing_byte_ = pkt.check_byte;
 
     return true;
 }

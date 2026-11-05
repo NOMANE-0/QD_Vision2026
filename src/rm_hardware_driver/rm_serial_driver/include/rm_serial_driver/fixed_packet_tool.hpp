@@ -20,6 +20,7 @@
 #define SERIAL_DRIVER_FIXED_PACKET_TOOL_HPP_
 
 // std
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -53,7 +54,13 @@ public:
   void enbaleRealtimeSend(bool enable);
   void enbaleDataPrint(bool enable) { use_data_print_ = enable; }
   bool sendPacket(const FixedPacket<capacity> &packet);
-  bool recvPacket(FixedPacket<capacity> &packet);
+    /**
+     * @brief 从串口字节流中按帧头对齐并提取一帧定长数据。
+     * @param packet 输出完整帧；读取失败时保持原值。
+     * @return 是否成功接收到帧头和帧尾有效的完整帧。
+     * @note 单线程调用；会持续读取直到收齐一帧或传输失败，半帧会保留等待后续字节。
+     */
+    bool recvPacket(FixedPacket<capacity>& packet);
 
   std::string getErrorMessage() { return transporter_->errorMessage(); }
 
@@ -66,7 +73,7 @@ private:
   // data
   uint8_t tmp_buffer_[capacity];       // NOLINT
   uint8_t recv_buffer_[capacity * 2];  // NOLINT
-  int recv_buf_len_;
+  int recv_buf_len_{0};
   // for realtime sending
   bool use_realtime_send_{false};
   bool use_data_print_{false};
@@ -148,59 +155,45 @@ bool FixedPacketTool<capacity>::sendPacket(const FixedPacket<capacity> &packet) 
 
 template <int capacity>
 bool FixedPacketTool<capacity>::recvPacket(FixedPacket<capacity> &packet) {
-  int recv_len = transporter_->read(tmp_buffer_, capacity);
-  if (recv_len > 0) {
-    // print data
-    if (use_data_print_) {
-      for (int i = 0; i < recv_len; i++) {
-        std::cout << std::hex << static_cast<int>(tmp_buffer_[i]) << " ";
-        // std::cout << static_cast<int>(tmp_buffer_[i]) << " ";
-      }
-      std::cout << "\n";
-    }
+    while (true) {
+        // 丢弃帧头前的杂字节，将第一个 0xFF 对齐到缓存第 0 位。
+        const auto* head = std::find(recv_buffer_, recv_buffer_ + recv_buf_len_, 0xff);
+        const int skipped = static_cast<int>(head - recv_buffer_);
+        recv_buf_len_ -= skipped;
+        std::memmove(recv_buffer_, head, recv_buf_len_);
 
-    // check packet
-    if (checkPacket(tmp_buffer_, recv_len)) {
-      packet.copyFrom(tmp_buffer_);
-      return true;
-    } else {
-      // 如果是断帧，拼接缓存，并遍历校验，获得合法数据
-      FYT_INFO("serial_driver", "checkPacket() failed, check if it is a broken frame");
-      if (recv_buf_len_ + recv_len > capacity * 2) {
-        recv_buf_len_ = 0;
-      }
-      // 拼接缓存
-      memcpy(recv_buffer_ + recv_buf_len_, tmp_buffer_, recv_len);
-      recv_buf_len_ = recv_buf_len_ + recv_len;
-      // 遍历校验
-      for (int i = 0; (i + capacity) <= recv_buf_len_; i++) {
-        if (checkPacket(recv_buffer_ + i, capacity)) {
-          packet.copyFrom(recv_buffer_ + i);
-          // 读取一帧后，更新接收缓存
-          int k = 0;
-          for (int j = i + capacity; j < recv_buf_len_; j++, k++) {
-            recv_buffer_[k] = recv_buffer_[j];
-          }
-          recv_buf_len_ = k;
-          return true;
+        if (recv_buf_len_ >= capacity) {
+            if (checkPacket(recv_buffer_, capacity)) {
+                packet.copyFrom(recv_buffer_);
+                recv_buf_len_ -= capacity;
+                std::memmove(recv_buffer_, recv_buffer_ + capacity, recv_buf_len_);
+                return true;
+            }
+            // 固定位置的帧尾不匹配，只丢弃当前候选帧头，再搜索下一帧。
+            --recv_buf_len_;
+            std::memmove(recv_buffer_, recv_buffer_ + 1, recv_buf_len_);
+            continue;
         }
-      }
-      // 表明断帧，或错误帧。
-      FYT_WARN("serial_driver",
-               "checkPacket() failed with recv_len:{}, frame head:{}, frame end:{}",
-               recv_len,
-               tmp_buffer_[0],
-               tmp_buffer_[recv_len - 1]);
-      return false;
+
+        // 已对齐的半帧保留；不足一帧是正常状态，继续等待后续字节。
+        const int recv_len = transporter_->read(tmp_buffer_, capacity);
+        if (recv_len <= 0) {
+            FYT_ERROR("serial_driver", "transporter_->read() failed");
+            recv_buf_len_ = 0;
+            transporter_->close();
+            transporter_->open();
+            return false;
+        }
+        if (use_data_print_) {
+            for (int i = 0; i < recv_len; ++i) {
+                std::cout << std::hex << static_cast<int>(tmp_buffer_[i]) << " ";
+            }
+            std::cout << std::dec << "\n";
+        }
+        // 上方已处理所有完整候选帧，剩余量小于 capacity，追加后不会超过缓存大小。
+        std::memcpy(recv_buffer_ + recv_buf_len_, tmp_buffer_, recv_len);
+        recv_buf_len_ += recv_len;
     }
-  } else {
-    FYT_ERROR("serial_driver", "transporter_->read() failed");
-    // reconnect
-    transporter_->close();
-    transporter_->open();
-    // 串口错误
-    return false;
-  }
 }
 
 using FixedPacketTool16 = FixedPacketTool<16>;

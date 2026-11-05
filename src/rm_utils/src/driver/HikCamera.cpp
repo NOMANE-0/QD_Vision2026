@@ -15,7 +15,7 @@ HikCamera::~HikCamera() {
     if (camera_handle_ != nullptr) {
         MV_CC_StopGrabbing(camera_handle_);
         MV_CC_CloseDevice(camera_handle_);
-        MV_CC_DestroyHandle(&camera_handle_);
+        MV_CC_DestroyHandle(camera_handle_);
     }
     if (daemon_thread_.joinable()) {
         daemon_thread_.join();
@@ -119,12 +119,12 @@ void HikCamera::read_img(cv::Mat& img, std::chrono::system_clock::time_point& ti
 }
 
 void* HikCamera::get_camera_handle(const Parameters& params) {
-    void* handle;
-    MVCC_STRINGVALUE string_value;
+    void* handle = nullptr;
+    MVCC_STRINGVALUE string_value {};
 
     // 枚举设备
-    MV_CC_DEVICE_INFO_LIST device_list;
-    nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
+    MV_CC_DEVICE_INFO_LIST device_list {};
+    nRet = MV_CC_EnumDevices(MV_USB_DEVICE | MV_GIGE_DEVICE, &device_list);
 
     // 等待设备连接
     int count = 4;
@@ -136,7 +136,7 @@ void* HikCamera::get_camera_handle(const Parameters& params) {
             return nullptr;
         }
 
-        nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
+        nRet = MV_CC_EnumDevices(MV_USB_DEVICE | MV_GIGE_DEVICE, &device_list);
     }
 
     // 查找序列号
@@ -157,18 +157,19 @@ void* HikCamera::get_camera_handle(const Parameters& params) {
         nRet = MV_CC_OpenDevice(handle);
         if (nRet != MV_OK) {
             printf("OpenDevice failed! nRet [0x%x]\n", nRet);
+            MV_CC_DestroyHandle(handle);
             continue;
         }
 
         // 获取序列号
-        MV_CC_GetStringValue(handle, "DeviceSerialNumber", &string_value);
+        nRet = MV_CC_GetStringValue(handle, "DeviceSerialNumber", &string_value);
         std::cout << "Found DeviceSerialNumber: " << string_value.chCurValue << std::endl;
 
         MV_CC_CloseDevice(handle);
         MV_CC_DestroyHandle(handle);
 
         // 比较序列号
-        if (std::string(string_value.chCurValue) == params.device_serial_number) {
+        if (nRet == MV_OK && std::string(string_value.chCurValue) == params.device_serial_number) {
             device_info = device;
             std::cout << "Found Target DeviceSerialNumber: " << string_value.chCurValue
                       << std::endl;
@@ -185,8 +186,23 @@ void* HikCamera::get_camera_handle(const Parameters& params) {
     // 打开设备
     nRet = MV_CC_CreateHandle(&handle, device_info);
     printf("MV_CC_CreateHandle! nRet [0x%x]\n", nRet);
+    if (nRet != MV_OK) {
+        return nullptr;
+    }
     nRet = MV_CC_OpenDevice(handle);
     printf("MV_CC_OpenDevice! nRet [0x%x]\n", nRet);
+    if (nRet != MV_OK) {
+        MV_CC_DestroyHandle(handle);
+        return nullptr;
+    }
+    // 网口相机根据链路 MTU 配置包长，避免默认包长造成取流失败。
+    if (device_info->nTLayerType == MV_GIGE_DEVICE) {
+        const int packet_size = MV_CC_GetOptimalPacketSize(handle);
+        if (packet_size > 0) {
+            nRet = MV_CC_SetIntValue(handle, "GevSCPSPacketSize", packet_size);
+            printf("Set GevSCPSPacketSize! nRet [0x%x]\n", nRet);
+        }
+    }
     MV_CC_GetStringValue(handle, "DeviceSerialNumber", &string_value);
     std::cout << "Select DeviceSerialNumber: " << string_value.chCurValue << std::endl;
     // 设置相机参数
@@ -194,6 +210,11 @@ void* HikCamera::get_camera_handle(const Parameters& params) {
     // 开始取流
     nRet = MV_CC_StartGrabbing(handle);
     printf("MV_CC_StartGrabbing! nRet [0x%x]\n", nRet);
+    if (nRet != MV_OK) {
+        MV_CC_CloseDevice(handle);
+        MV_CC_DestroyHandle(handle);
+        return nullptr;
+    }
 
     return handle;
 }
@@ -210,6 +231,13 @@ void HikCamera::set_hik_param(void* handle, const Parameters& params) {
     // 帧率限制
     nRet = MV_CC_SetFloatValue(handle, "AcquisitionFrameRate", params.frame_rate);
     printf("Set AcquisitionFrameRate! nRet [0x%x]\n", nRet);
+    // 关闭设备内的自动曝光、自动增益与外部触发，使用配置文件中的固定值。
+    nRet = MV_CC_SetEnumValueByString(handle, "TriggerMode", "Off");
+    printf("Set TriggerMode! nRet [0x%x]\n", nRet);
+    nRet = MV_CC_SetEnumValueByString(handle, "ExposureAuto", "Off");
+    printf("Set ExposureAuto! nRet [0x%x]\n", nRet);
+    nRet = MV_CC_SetEnumValueByString(handle, "GainAuto", "Off");
+    printf("Set GainAuto! nRet [0x%x]\n", nRet);
     // 曝光
     nRet = MV_CC_SetFloatValue(handle, "ExposureTime", params.exposure_time);
     printf("Set ExposureTime! nRet [0x%x]\n", nRet);
